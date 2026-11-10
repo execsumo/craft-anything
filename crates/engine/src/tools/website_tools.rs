@@ -148,7 +148,7 @@ pub fn check_url(url: &str) -> Result<&str, ToolError> {
 }
 
 /// A URL as shown in evidence and summaries: no credentials, query or fragment.
-fn shown_url(url: &str) -> String {
+pub(crate) fn shown_url(url: &str) -> String {
     web_common::sanitize_url(url).split(['?', '#']).next().unwrap_or_default().to_string()
 }
 
@@ -162,10 +162,8 @@ fn web_site_open(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolErr
     let saved = chosen_sign_in(ctx.session, &url, p.signed_in)?;
     let want = saved.as_ref().map(|s| s.key.clone());
     // A browser started for another sign-in (or none) isn't reused: each site sees only its own.
+    // The new one replaces it once it has started, so a failed start leaves the old one open.
     let reuse = live_site(ctx, &dl).filter(|s| s.signed_in == want);
-    if reuse.is_none() {
-        ctx.session.ext.remove::<SiteBrowser>();
-    }
     let site = match reuse {
         Some(s) => s,
         None => {
@@ -217,6 +215,8 @@ fn web_site_open(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolErr
         (0, 0) => opened,
         (e, f) => format!("{opened} While loading: {e} error(s), {f} failed request(s)."),
     };
+    // Pages opened signed in often land on addresses carrying codes or tokens: keep only the path.
+    let (final_url, facts) = if want.is_some() { signed_in_urls(final_url, facts) } else { (final_url, facts) };
     let browser = site.handle();
     let ev = EvidenceBuilder::new(
         "web_site_open",
@@ -251,6 +251,16 @@ fn chosen_sign_in(session: &crate::session::Session, url: &str, signed_in: Optio
         )));
     }
     Ok(saved)
+}
+
+/// A signed-in page's address and the facts' copy of it without query or fragment.
+fn signed_in_urls(url: String, mut facts: Value) -> (String, Value) {
+    if let Some(f) = facts.as_object_mut()
+        && let Some(u) = f.get("url").and_then(Value::as_str).map(shown_url)
+    {
+        f.insert("url".into(), json!(u));
+    }
+    (shown_url(&url), facts)
 }
 
 /// What the opened pages' browser profile means for what they show.
@@ -305,7 +315,7 @@ fn set_viewport(client: &mut CdpClient, width: u32, height: u32, dl: &Deadline) 
 }
 
 /// Open `url` and wait for it to settle; returns what went wrong while it loaded ([`page_health`]).
-fn navigate(client: &mut CdpClient, url: &str, width: u32, height: u32, settle_ms: u64, dl: &Deadline) -> Result<Value, ToolError> {
+pub(crate) fn navigate(client: &mut CdpClient, url: &str, width: u32, height: u32, settle_ms: u64, dl: &Deadline) -> Result<Value, ToolError> {
     client.call("Page.enable", json!({}), None, dl)?;
     // Errors and failed requests are read from the browser's own events; a browser that refuses
     // one of these still loads the page.
@@ -401,7 +411,7 @@ pub fn page_health(events: &[CdpEvent]) -> Value {
 }
 
 /// Evaluate one of our own read-only scripts in the page and return its JSON value.
-fn eval(client: &mut CdpClient, script: &str, dl: &Deadline) -> Result<Value, ToolError> {
+pub(crate) fn eval(client: &mut CdpClient, script: &str, dl: &Deadline) -> Result<Value, ToolError> {
     let r = client.call("Runtime.evaluate", json!({"expression": script, "returnByValue": true, "awaitPromise": true}), None, dl)?;
     if let Some(ex) = r.get("exceptionDetails") {
         let m = ex.pointer("/exception/description").or_else(|| ex.get("text")).and_then(Value::as_str).unwrap_or("script error");
@@ -876,8 +886,11 @@ fn web_site_capture(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Tool
         b.insert("health".into(), h.clone());
     }
     let signed_in = site.signed_in.is_some();
-    let sign_in_page = !signed_in && has_password_field(&blueprint);
+    let sign_in_page = has_password_field(&blueprint);
     if let Value::Object(b) = &mut blueprint {
+        if signed_in && let Some(u) = b.get("url").and_then(Value::as_str).map(shown_url) {
+            b.insert("url".into(), json!(u));
+        }
         b.insert("signed_in".into(), json!(signed_in));
         b.insert("signed_in_site".into(), json!(site.signed_in));
         b.insert("sign_in_page".into(), json!(sign_in_page));
@@ -928,7 +941,7 @@ fn web_site_capture(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Tool
         })
         .limitations(html_cut(html))
         .limitations(site.signed_in.as_deref().map(|s| profile_limitation(Some(s))))
-        .limitations(sign_in_page.then(|| Limitation::new("sign_in_page", SIGN_IN_HINT)))
+        .limitations(sign_in_page.then(|| if signed_in { Limitation::new("sign_in_ended", SIGN_IN_ENDED) } else { Limitation::new("sign_in_page", SIGN_IN_HINT) }))
         .coverage(Coverage::complete(p.widths.len() as u64))
         .location(Location::new("url", shown))
         .location(Location::new("path", out.display().to_string()))
@@ -937,7 +950,10 @@ fn web_site_capture(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Tool
 }
 
 /// Said when a page captured signed out asks for a password.
-const SIGN_IN_HINT: &str = "This looks like a sign-in page. To study what's behind it, sign in once with web_site_sign_in and capture again.";
+const SIGN_IN_HINT: &str =
+    "This may be a sign-in page (it asks for a password). To study what's behind it, sign in once with web_site_sign_in and capture again.";
+/// Said when a page captured with a saved sign-in still asks for a password.
+const SIGN_IN_ENDED: &str = "This was opened with your saved sign-in but may still be a sign-in page (it asks for a password): the site may have ended that sign-in. Sign in again with web_site_sign_in and capture again.";
 
 /// The page asks for a password: a field of type password in its forms or its outline.
 fn has_password_field(blueprint: &Value) -> bool {
@@ -1106,12 +1122,15 @@ fn readme(b: &Value, shots: &[Value], (html_bytes, html_total): (usize, usize), 
         b.pointer("/page/w").and_then(Value::as_u64).unwrap_or(0),
         b.pointer("/page/h").and_then(Value::as_u64).unwrap_or(0)
     ));
-    if b.get("signed_in") == Some(&Value::Bool(true)) {
+    let yes = |k: &str| b.get(k) == Some(&Value::Bool(true));
+    if yes("signed_in") && yes("sign_in_page") {
+        md.push_str(&format!("{SIGN_IN_ENDED}\n\n"));
+    } else if yes("signed_in") {
         md.push_str(&format!(
             "Captured signed in, with the person's saved sign-in for {}: this is the site as they see it when signed in, and the pictures and text may show their own account's data.\n\n",
             s("/signed_in_site")
         ));
-    } else if b.get("sign_in_page") == Some(&Value::Bool(true)) {
+    } else if yes("sign_in_page") {
         md.push_str(&format!("{SIGN_IN_HINT}\n\n"));
     }
     md.push_str("## Files\n\n");
@@ -1338,6 +1357,10 @@ mod tests {
         let signed = page(json!({"signed_in": true, "signed_in_site": "ex.com", "sign_in_page": false}));
         assert!(signed.contains("Captured signed in") && signed.contains("ex.com") && !signed.contains(SIGN_IN_HINT), "{signed}");
         assert!(!page(json!({})).contains("signed in"));
+        let ended = page(json!({"signed_in": true, "signed_in_site": "ex.com", "sign_in_page": true}));
+        assert!(ended.contains(SIGN_IN_ENDED) && !ended.contains("Captured signed in"), "{ended}");
+        let (u, f) = signed_in_urls("https://ex.com/inbox?code=abc#t".into(), json!({"url": "https://ex.com/inbox?code=abc", "title": "x"}));
+        assert_eq!((u.as_str(), f["url"].as_str()), ("https://ex.com/inbox", Some("https://ex.com/inbox")));
         assert!(profile_limitation(Some("ex.com")).message.contains("your own account"));
         assert_eq!(profile_limitation(None).code, "private_profile");
     }

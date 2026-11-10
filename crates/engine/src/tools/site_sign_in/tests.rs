@@ -8,17 +8,22 @@ fn granted() -> CallOptions<'static> {
 #[test]
 fn a_site_key_is_the_host_and_a_port_that_isnt_the_default() {
     let k = |u: &str| site_key(u).unwrap();
-    assert_eq!(k("https://Example.COM/path?q=1#x"), "example.com");
-    assert_eq!(k("https://example.com:443/"), "example.com");
-    assert_eq!(k("http://example.com:80"), "example.com");
-    assert_eq!(k("http://example.com:443"), "example.com_443");
-    assert_eq!(k("https://app.example.com:8443/x"), "app.example.com_8443");
-    assert_eq!(k("http://127.0.0.1:5173/"), "127.0.0.1_5173");
-    assert_eq!(k("http://[::1]:3000/"), "ip6_--1_3000");
-    assert_eq!(k("https://user:pw@example.com/"), "example.com", "credentials are not part of the key");
-    assert_eq!(k("https://example.com./"), "example.com");
-    assert_eq!(k("https://xn--bcher-kva.example/"), "xn--bcher-kva.example", "punycode is a name like any other");
+    assert_eq!(k("https://Example.COM/path?q=1#x"), "site-example.com");
+    assert_eq!(k("https://example.com:443/"), "site-example.com");
+    assert_eq!(k("http://example.com:80"), "site-example.com");
+    assert_eq!(k("http://example.com:443"), "site-example.com_443");
+    assert_eq!(k("https://app.example.com:8443/x"), "site-app.example.com_8443");
+    assert_eq!(k("http://127.0.0.1:5173/"), "site-127.0.0.1_5173");
+    assert_eq!(k("http://[::1]:3000/"), "site-ip6_--1_3000");
+    assert_eq!(k("https://user:pw@example.com/"), "site-example.com", "credentials are not part of the key");
+    assert_eq!(k("https://example.com./"), "site-example.com");
+    assert_eq!(k("https://xn--bcher-kva.example/"), "site-xn--bcher-kva.example", "punycode is a name like any other");
     assert_ne!(k("https://a.example.com/"), k("https://example.com/"), "exact host only");
+    // Names Windows reserves for devices never become a folder name on their own.
+    assert_eq!(k("https://con/"), "site-con");
+    assert_eq!(k("https://nul.example.com/"), "site-nul.example.com");
+    assert!(site_key("https://example.com../").is_err(), "only one trailing dot is the same host");
+    assert!(site_key(&format!("https://{}.example/", "a".repeat(120))).is_err(), "keys stay short enough for any path");
 }
 
 #[test]
@@ -76,7 +81,7 @@ fn save_fixture(session: &Session, key: &str) -> PathBuf {
 #[test]
 fn a_profile_copy_skips_caches_locks_and_links() {
     let s = crate::testing::session();
-    let from = save_fixture(&s, "example.com");
+    let from = save_fixture(&s, "site-example.com");
     let outside = tempfile::tempdir().unwrap();
     std::fs::write(outside.path().join("secret"), b"not ours").unwrap();
     #[cfg(unix)]
@@ -106,9 +111,99 @@ fn a_profile_copy_skips_caches_locks_and_links() {
 }
 
 #[test]
+fn session_cookies_are_kept_whatever_preferences_were_there() {
+    let prefs_after = |before: Option<&[u8]>| {
+        let d = tempfile::tempdir().unwrap();
+        if let Some(b) = before {
+            std::fs::create_dir_all(d.path().join("Default")).unwrap();
+            std::fs::write(d.path().join("Default/Preferences"), b).unwrap();
+        }
+        keep_session_cookies(d.path()).unwrap();
+        serde_json::from_slice::<Value>(&std::fs::read(d.path().join("Default/Preferences")).unwrap()).unwrap()
+    };
+    assert_eq!(prefs_after(None)["session"]["restore_on_startup"], 1);
+    let merged = prefs_after(Some(br#"{"intl": {"accept_languages": "en"}, "session": {"restore_on_startup": 5, "x": 2}}"#));
+    assert_eq!(
+        (merged["session"]["restore_on_startup"].as_u64(), merged["session"]["x"].as_u64(), merged["intl"]["accept_languages"].as_str()),
+        (Some(1), Some(2), Some("en"))
+    );
+    for hostile in [&b"not json"[..], b"[1,2]", br#"{"session": "nope"}"#, b"\xff\xfe", b""] {
+        assert_eq!(prefs_after(Some(hostile))["session"]["restore_on_startup"], 1, "{:?}", String::from_utf8_lossy(hostile));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn saved_sign_ins_are_owner_only() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let s = crate::testing::session();
+    let from = save_fixture(&s, "site-from.example");
+    let dir = sign_ins_dir(&s).join("site-example.com");
+    keep_profile(&from, &dir).unwrap();
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&sign_ins_dir(&s)), 0o700);
+    assert_eq!(mode(&dir), 0o700);
+    assert_eq!(mode(&dir.join(PROFILE_DIR)), 0o700);
+    assert_eq!(mode(&dir.join(PROFILE_DIR).join("Default")), 0o700);
+    assert_eq!(mode(&dir.join(PROFILE_DIR).join("Default/Cookies")), 0o600);
+}
+
+/// A new sign-in replaces the old one whole, and leftovers of a run that stopped part-way are
+/// cleared; a folder that's only half there is never reported as saved.
+#[test]
+fn a_new_sign_in_replaces_the_old_one_whole() {
+    let s = crate::testing::session();
+    let first = save_fixture(&s, "site-first.example");
+    let dir = sign_ins_dir(&s).join("site-example.com");
+    keep_profile(&first, &dir).unwrap();
+    std::fs::create_dir_all(dir.join("profile.new-stale")).unwrap();
+    std::fs::create_dir_all(dir.join("profile.old-stale")).unwrap();
+    let second = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(second.path().join("Default")).unwrap();
+    std::fs::write(second.path().join("Default/Cookies"), b"second").unwrap();
+    keep_profile(second.path(), &dir).unwrap();
+    assert_eq!(std::fs::read(dir.join(PROFILE_DIR).join("Default/Cookies")).unwrap(), b"second");
+    assert!(!dir.join(PROFILE_DIR).join("Local State").exists(), "nothing of the old one is mixed in");
+    let names: Vec<String> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    assert_eq!(names, vec![PROFILE_DIR.to_string()], "no staging or old folders are left");
+    assert_eq!(saved(&s, "site-example.com"), None, "no record yet: the tool writes it last");
+}
+
+#[test]
+fn a_window_counts_as_closed_only_when_it_stays_closed() {
+    let t0 = Instant::now();
+    let at = |ms: u64| t0 + Duration::from_millis(ms);
+    let mut w = CloseWatch::default();
+    assert!(!w.closed(Look::Silent, at(0)), "one slow answer isn't a close");
+    assert!(!w.closed(Look::NoPages, at(700)));
+    assert!(!w.closed(Look::Open, at(1400)), "a page came back: start again");
+    assert!(!w.closed(Look::NoPages, at(2100)));
+    assert!(!w.closed(Look::NoPages, at(2800)));
+    assert!(!w.closed(Look::Silent, at(3500)), "three looks, but not yet 2 s");
+    assert!(w.closed(Look::Silent, at(4200)));
+    assert!(CloseWatch::default().closed(Look::Exited, at(0)), "the browser exiting is enough");
+}
+
+#[test]
+fn a_check_after_saving_is_typed_and_never_fails_the_sign_in() {
+    let ok =
+        Checked { sign_in_page: false, url: "https://ex.com/inbox".into(), picture: json!({"path": "check.png", "sha256": "ab", "width": 10, "height": 10}) };
+    let (v, notes) = check_result(Ok(ok.clone()));
+    assert_eq!((v["done"].as_bool(), v["sign_in_page"].as_bool(), v["url"].as_str()), (Some(true), Some(false), Some("https://ex.com/inbox")));
+    assert!(notes.iter().any(|n| n.code == "check_picture" && n.message.contains("your own account")));
+    assert!(!notes.iter().any(|n| n.code == "sign_in_not_kept"));
+    let (v, notes) = check_result(Ok(Checked { sign_in_page: true, ..ok }));
+    assert_eq!(v["sign_in_page"], true);
+    assert!(notes.iter().any(|n| n.code == "sign_in_not_kept" && n.message.contains("remember me")));
+    let (v, notes) = check_result(Err(ToolError::new(ErrorCode::TimedOut, "the page took too long")));
+    assert_eq!((v["done"].as_bool(), v["sign_in_page"].is_null(), v["error"].as_str()), (Some(false), true, Some("the page took too long")));
+    assert!(notes.iter().any(|n| n.code == "not_checked_after"));
+}
+
+#[test]
 fn a_profile_copy_over_a_cap_is_refused() {
     let s = crate::testing::session();
-    let from = save_fixture(&s, "example.com");
+    let from = save_fixture(&s, "site-example.com");
     let refused = |caps: CopyCaps| {
         let to = tempfile::tempdir().unwrap();
         copy_profile(&from, to.path(), &caps).unwrap_err()
@@ -126,13 +221,13 @@ fn a_profile_copy_over_a_cap_is_refused() {
 fn signing_out_forgets_only_that_site_and_nothing_saved_is_fine() {
     let s = crate::testing::session();
     let base = sign_ins_dir(&s);
-    save_fixture(&s, "example.com");
-    save_fixture(&s, "other.example");
+    save_fixture(&s, "site-example.com");
+    save_fixture(&s, "site-other.example");
     let e = Engine::new(s);
     let out = e.call(SIGN_OUT_TOOL, json!({"url": "https://EXAMPLE.com/account"}), CallOptions::new(Caller::Cli)).unwrap().to_json();
     assert_eq!(out["result"]["removed"], true, "{out}");
-    assert!(!base.join("example.com").exists());
-    assert!(base.join("other.example").join(RECORD_FILE).is_file(), "another site's sign-in stays");
+    assert!(!base.join("site-example.com").exists());
+    assert!(base.join("site-other.example").join(RECORD_FILE).is_file(), "another site's sign-in stays");
     let again = e.call(SIGN_OUT_TOOL, json!({"url": "https://example.com/"}), CallOptions::new(Caller::Cli)).unwrap().to_json();
     assert_eq!(again["result"]["removed"], false);
     assert!(again["summary"].as_str().unwrap().contains("nothing to forget"));
@@ -147,7 +242,7 @@ fn signing_out_removes_a_link_not_what_it_points_at() {
     std::fs::create_dir_all(&base).unwrap();
     let elsewhere = tempfile::tempdir().unwrap();
     std::fs::write(elsewhere.path().join("keep"), b"x").unwrap();
-    std::os::unix::fs::symlink(elsewhere.path(), base.join("example.com")).unwrap();
+    std::os::unix::fs::symlink(elsewhere.path(), base.join("site-example.com")).unwrap();
     let out = Engine::new(s).call(SIGN_OUT_TOOL, json!({"url": "https://example.com"}), CallOptions::new(Caller::Cli)).unwrap().to_json();
     assert_eq!(out["result"]["removed"], true);
     assert!(elsewhere.path().join("keep").is_file());
@@ -156,15 +251,15 @@ fn signing_out_removes_a_link_not_what_it_points_at() {
 #[test]
 fn a_saved_sign_in_needs_its_record_and_a_real_profile() {
     let s = crate::testing::session();
-    assert_eq!(saved(&s, "example.com"), None);
-    let profile = save_fixture(&s, "example.com");
-    assert_eq!(saved(&s, "example.com").map(|x| x.profile), Some(profile.clone()));
+    assert_eq!(saved(&s, "site-example.com"), None);
+    let profile = save_fixture(&s, "site-example.com");
+    assert_eq!(saved(&s, "site-example.com").map(|x| x.profile), Some(profile.clone()));
     // A record for another site, or a newer version, isn't used.
-    let record = sign_ins_dir(&s).join("example.com").join(RECORD_FILE);
-    std::fs::write(&record, json!({"version": 2, "site": "example.com"}).to_string()).unwrap();
-    assert_eq!(saved(&s, "example.com"), None);
-    std::fs::write(&record, json!({"version": 1, "site": "other.example"}).to_string()).unwrap();
-    assert_eq!(saved(&s, "example.com"), None);
+    let record = sign_ins_dir(&s).join("site-example.com").join(RECORD_FILE);
+    std::fs::write(&record, json!({"version": 2, "site": "site-example.com"}).to_string()).unwrap();
+    assert_eq!(saved(&s, "site-example.com"), None);
+    std::fs::write(&record, json!({"version": 1, "site": "site-other.example"}).to_string()).unwrap();
+    assert_eq!(saved(&s, "site-example.com"), None);
 }
 
 #[test]
@@ -174,7 +269,7 @@ fn signed_in_true_with_nothing_saved_names_the_sign_in_tool() {
     s.settings.engines.tools.chromium = Some(std::env::current_exe().unwrap());
     let err = Engine::new(s).call("web_site_open", json!({"url": "https://example.com", "signed_in": true}), granted()).unwrap_err();
     assert_eq!(err.code, ErrorCode::NotFound, "{}", err.message);
-    assert!(err.message.contains("example.com"), "{}", err.message);
+    assert!(err.message.contains("site-example.com"), "{}", err.message);
     assert!(err.remediation.unwrap_or_default().contains(SIGN_IN_TOOL));
 }
 
@@ -224,7 +319,7 @@ fn opening_a_site_with_a_saved_sign_in_starts_from_a_copy() {
     let logs = tempfile::tempdir().unwrap();
     let mut s = crate::testing::session();
     s.settings.engines.tools.chromium = Some(recording_browser(logs.path()));
-    let saved_profile = save_fixture(&s, "example.com");
+    let saved_profile = save_fixture(&s, "site-example.com");
     let e = Engine::new(s);
     let open = |p: Value| {
         for f in ["args", "profile", "listing"] {
@@ -269,6 +364,11 @@ fn live_in(dir: &Path) -> Session {
 /// A site with a sign-in: `/account` is "Signed in" with the `sid` cookie and a sign-in form
 /// without it; `/login` sets `sid` (HttpOnly, with an expiry) and a plain `pref` cookie.
 fn test_site() -> String {
+    serve_site(false)
+}
+
+/// The test site; `forgets` makes `/account` ignore the cookie (a site whose sign-in isn't kept).
+fn serve_site(forgets: bool) -> String {
     use std::io::{Read, Write};
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -285,7 +385,7 @@ fn test_site() -> String {
             }
             let req = String::from_utf8_lossy(&req).to_string();
             let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
-            let signed = req.lines().any(|l| l.to_ascii_lowercase().starts_with("cookie:") && l.contains("sid=ok"));
+            let signed = !forgets && req.lines().any(|l| l.to_ascii_lowercase().starts_with("cookie:") && l.contains("sid=ok"));
             let session_only = req.lines().any(|l| l.to_ascii_lowercase().starts_with("cookie:") && l.contains("tmp=1"));
             let reply = if path.starts_with("/login") {
                 "HTTP/1.1 302 Found\r\nSet-Cookie: sid=ok; Max-Age=86400; Path=/; HttpOnly\r\nSet-Cookie: pref=1; Max-Age=86400; Path=/\r\nSet-Cookie: tmp=1; Path=/\r\nLocation: /account\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
@@ -384,6 +484,11 @@ fn a_sign_in_made_in_a_window_is_seen_by_a_headless_capture() {
     helper.join().unwrap();
     assert_eq!(v["result"]["saved"], true, "{v}");
     assert_eq!(v["result"]["ended"], "closed", "{v}");
+    let check = &v["result"]["check"];
+    assert_eq!((check["done"].as_bool(), check["sign_in_page"].as_bool()), (Some(true), Some(false)), "{check}");
+    let picture = PathBuf::from(check["picture"]["path"].as_str().unwrap());
+    assert!(std::fs::metadata(&picture).unwrap().len() > 1000, "a real picture of the page");
+    assert!(picture.starts_with(cfg.path()), "the picture stays in Craft Anything's folder");
 
     let out = tempfile::tempdir().unwrap();
     let opened = e.call("web_site_open", json!({"url": format!("{base}/account")}), granted()).unwrap().to_json();
@@ -393,10 +498,8 @@ fn a_sign_in_made_in_a_window_is_seen_by_a_headless_capture() {
     assert_eq!(cap["title"], "Signed in", "the session cookie didn't survive: {}", cap["title"]);
     assert_eq!(cap["signed_in"], true);
     assert_eq!(cap["sign_in_page"], false);
-    // A cookie with no expiry ends with the browser that set it, as in any browser: the
-    // sign-in tool's evidence says so.
-    assert_eq!(cap["headings"][1]["text"], "session-only cookie kept: false", "{}", cap["headings"]);
-    assert!(v["limitations"].to_string().contains("session_only"), "{}", v["limitations"]);
+    // A cookie with no expiry (a sign-in without "remember me") is kept too.
+    assert_eq!(cap["headings"][1]["text"], "session-only cookie kept: true", "{}", cap["headings"]);
 
     e.call("web_site_open", json!({"url": format!("{base}/account"), "signed_in": false}), granted()).unwrap();
     let cap = title_of_capture(&e, out.path(), "forced-private");
@@ -465,4 +568,18 @@ fn without_a_desktop_signing_in_is_refused_at_once() {
     assert!(started.elapsed() < Duration::from_secs(5));
     assert_eq!(err.code, ErrorCode::NotSupported, "{}", err.message);
     println!("{} / {}", err.message, err.remediation.unwrap_or_default());
+}
+
+/// A site that doesn't keep the sign-in: the check after saving says it still asks for a password.
+#[test]
+#[ignore]
+fn a_sign_in_the_site_forgets_is_caught_by_the_check() {
+    let base = serve_site(true);
+    let cfg = tempfile::tempdir().unwrap();
+    let e = Engine::new(live_in(cfg.path()));
+    let helper = person(base.clone(), browser_profiles(), true);
+    let v = e.call(SIGN_IN_TOOL, json!({"url": format!("{base}/account"), "timeout_secs": 120}), granted()).unwrap().to_json();
+    helper.join().unwrap();
+    assert_eq!(v["result"]["check"]["sign_in_page"], true, "{}", v["result"]["check"]);
+    assert!(v["limitations"].to_string().contains("sign_in_not_kept"), "{}", v["limitations"]);
 }

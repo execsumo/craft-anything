@@ -166,12 +166,18 @@ fn snap_in_script(script: &[u8]) -> Option<std::path::PathBuf> {
 }
 
 impl Browser {
-    /// A handle to a browser someone else owns (it is not killed when this drops).
     /// The profile folder of a browser we launched (deleted when this is dropped).
     pub(crate) fn profile_dir(&self) -> Option<&std::path::Path> {
         self._profile.as_ref().map(|p| p.0.as_path())
     }
 
+    /// Stop a browser we launched and wait (at most `d`) until it's gone. Returns whether it
+    /// confirmed in time.
+    pub(crate) fn stop_and_wait(&mut self, d: Duration) -> bool {
+        self._proc.as_mut().is_none_or(|p| p.kill_and_wait(d))
+    }
+
+    /// A handle to a browser someone else owns (it is not killed when this drops).
     pub fn attached(endpoint: &Endpoint, product: &str, version: &str) -> Browser {
         Browser {
             endpoint: endpoint.clone(),
@@ -228,6 +234,9 @@ impl Browser {
         if let ProfileChoice::SeededFrom(saved) = &opts.profile {
             // On error the half-filled copy is removed as `owned` drops.
             super::site_sign_in::copy_profile(saved, &owned.0, &super::site_sign_in::CopyCaps::default())?;
+        }
+        if opts.keeps_sign_in || opts.profile != ProfileChoice::Fresh {
+            super::site_sign_in::keep_session_cookies(&owned.0)?;
         }
         let (profile_dir, profile) = (owned.0.clone(), Some(owned));
         let mut args: Vec<String> = vec![

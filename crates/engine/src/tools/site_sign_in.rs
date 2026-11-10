@@ -30,22 +30,26 @@ pub const SIGN_OUT_TOOL: &str = "web_site_sign_out";
 const RECORD_VERSION: u64 = 1;
 const RECORD_FILE: &str = "sign-in.json";
 const PROFILE_DIR: &str = "profile";
-/// Longest site key (a host name is at most 253 characters, plus a port).
-const MAX_KEY_LEN: usize = 260;
+/// Longest site key: with the store's own path it stays well under Windows' 260-character limit
+/// for a path (most real host names are far shorter).
+const MAX_KEY_LEN: usize = 120;
+/// Every key starts with this, so no key is a name Windows reserves (`con`, `nul`, `com1`…).
+const KEY_PREFIX: &str = "site-";
 
 pub fn specs() -> Vec<ToolSpec> {
     vec![
         spec(
             SIGN_IN_TOOL,
             "Sign in to a website",
-            "Open a website in a visible browser window with a profile Craft Anything keeps for that site, and wait until you close the window (or timeout_secs passes, default 600, at most 1800). Sign in there yourself: Craft Anything never sees your password and never reads cookie or storage values. Later web_site_open calls for the same site (exact host and port) start with a copy of that sign-in, so studies and captures see the pages you see when signed in. web_site_sign_out forgets it. Needs a desktop where a window can open.",
-            "Sign in to a site once yourself, so its pages can be studied as you see them.",
+            "Open a website in a visible browser window with a profile Craft Anything keeps for that site, and wait until you close the window (or timeout_secs passes, default 600, at most 1800). Sign in there yourself: Craft Anything never sees your password and never reads cookie or storage values. Until you forget it with web_site_sign_out, every later web_site_open of that exact host and port (studies and captures included) starts with a copy of that sign-in, so it sees the pages you see when signed in. The sign-in is kept in Craft Anything's folder on this computer: anyone who can open your files here could use it. A new sign-in for the site replaces the earlier one. Needs a desktop where a window can open.",
+            "Sign in to a site once yourself, so its pages can be studied as you see them. The sign-in is kept on this computer, and used for that site until you forget it.",
             Toolset::Browser,
             Effects::EVIDENCE
                 .union(Effects::EXECUTES_FOREIGN_CODE)
                 .union(Effects::ACCESSES_NETWORK)
                 .union(Effects::LAUNCHES_PROCESS)
-                .union(Effects::WRITES_FILESYSTEM),
+                .union(Effects::WRITES_FILESYSTEM)
+                .union(Effects::MAY_DISCARD_DATA),
             Requires::Engine("chromium"),
             schema_of::<SignInParams>,
             web_site_sign_in,
@@ -67,9 +71,9 @@ pub fn specs() -> Vec<ToolSpec> {
 // ---------------------------------------------------------------------------------------------
 // Site keys and where saved sign-ins live
 
-/// The folder name a site's saved sign-in lives under: the URL's host in lower case, plus `_port`
-/// when the port isn't the scheme's default (`example.com`, `app.example.com_8443`, `127.0.0.1_5173`,
-/// `ip6_--1` for `[::1]`). Only `a-z`, `0-9`, `-`, `.` and `_` are allowed, so a key is always one
+/// The folder name a site's saved sign-in lives under: `site-` and the URL's host in lower case,
+/// plus `_port` when the port isn't the scheme's default (`site-example.com`,
+/// `site-app.example.com_8443`, `site-127.0.0.1_5173`, `site-ip6_--1` for `[::1]`). Only `a-z`, `0-9`, `-`, `.` and `_` are allowed, so a key is always one
 /// safe path component; a host with anything else (a Unicode name: give its `xn--` form) is refused,
 /// never rewritten, so two sites can't share a key.
 pub fn site_key(url: &str) -> Result<String, ToolError> {
@@ -103,12 +107,14 @@ pub fn site_key(url: &str) -> Result<String, ToolError> {
             None => (hostport.to_ascii_lowercase(), None),
         }
     };
-    let host = host.trim_end_matches('.');
+    // One trailing dot is the same host written fully; more is no host.
+    let host = host.strip_suffix('.').unwrap_or(&host);
     // `_` only ever comes from the IPv6 prefix above, so names and addresses can't collide.
     let name_ok = |h: &str| h.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.');
     let host_ok = !host.is_empty()
         && (name_ok(host) || host.strip_prefix("ip6_").is_some_and(|a| a.chars().all(|c| c.is_ascii_hexdigit() || c == '-')))
         && !host.starts_with('.')
+        && !host.ends_with('.')
         && !host.contains("..");
     if !host_ok {
         return Err(bad());
@@ -121,8 +127,8 @@ pub fn site_key(url: &str) -> Result<String, ToolError> {
         }
     };
     let key = match port {
-        Some(n) => format!("{host}_{n}"),
-        None => host.to_string(),
+        Some(n) => format!("{KEY_PREFIX}{host}_{n}"),
+        None => format!("{KEY_PREFIX}{host}"),
     };
     if key.len() > MAX_KEY_LEN {
         return Err(bad());
@@ -155,6 +161,37 @@ pub fn saved(session: &Session, key: &str) -> Option<SavedSignIn> {
     let profile = dir.join(PROFILE_DIR);
     let meta = std::fs::symlink_metadata(&profile).ok()?;
     meta.is_dir().then(|| SavedSignIn { key: key.to_string(), profile, saved_at: record.get("saved_at").and_then(Value::as_u64).unwrap_or(0) })
+}
+
+/// Largest `Preferences` file read back before changing it.
+const MAX_PREFERENCES_BYTES: u64 = 8 << 20;
+
+/// Make the browser profile at `profile` keep cookies that last only until the browser closes,
+/// the way a browser does when it's set to continue where it left off (`session.restore_on_startup`
+/// = 1 in `Default/Preferences`). The rest of an existing Preferences file is kept; one that is
+/// unreadable, too big or not a JSON object is replaced.
+pub fn keep_session_cookies(profile: &Path) -> Result<(), ToolError> {
+    let dir = profile.join("Default");
+    std::fs::create_dir_all(&dir).map_err(|e| ToolError::io(dir.display(), e))?;
+    let path = dir.join("Preferences");
+    let existing = std::fs::symlink_metadata(&path)
+        .ok()
+        .filter(|m| m.is_file() && m.len() <= MAX_PREFERENCES_BYTES)
+        .and_then(|_| std::fs::read(&path).ok())
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+    let mut prefs = match existing {
+        Some(Value::Object(m)) => m,
+        _ => serde_json::Map::new(),
+    };
+    let session = prefs.entry("session").or_insert_with(|| json!({}));
+    if !session.is_object() {
+        *session = json!({});
+    }
+    if let Value::Object(s) = session {
+        s.insert("restore_on_startup".into(), json!(1));
+    }
+    let bytes = serde_json::to_vec(&Value::Object(prefs)).map_err(|e| ToolError::internal(e.to_string()))?;
+    crate::project::write_atomic(&path, &bytes)
 }
 
 fn now_secs() -> u64 {
@@ -197,17 +234,66 @@ const SKIPPED_DIRS: &[&str] = &[
     "extensions_crx_cache",
     "optimization_guide_model_store",
     "Safe Browsing",
+    // The tabs that were open: a copy must not reopen them (its session cookies are kept anyway).
+    "Sessions",
 ];
 
 /// Files that belong to one running browser: its locks and the port it listened on.
-const SKIPPED_FILES: &[&str] = &["SingletonLock", "SingletonSocket", "SingletonCookie", "lockfile", "DevToolsActivePort", "RunningChromeVersion"];
+const SKIPPED_FILES: &[&str] = &[
+    "SingletonLock",
+    "SingletonSocket",
+    "SingletonCookie",
+    "lockfile",
+    "DevToolsActivePort",
+    "RunningChromeVersion",
+    "Current Session",
+    "Current Tabs",
+    "Last Session",
+    "Last Tabs",
+];
+
+/// Make a folder only its owner can open. On Windows the folder keeps the access rules of the
+/// person's own config folder, which already keeps other users out.
+fn private_dir(path: &Path) -> Result<(), ToolError> {
+    std::fs::create_dir(path).map_err(|e| ToolError::io(path.display(), e))?;
+    owner_only(path, 0o700)
+}
+
+/// Owner-only permissions on Unix (`mode`); on Windows the person's config folder's access rules apply.
+fn owner_only(path: &Path, mode: u32) -> Result<(), ToolError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).map_err(|e| ToolError::io(path.display(), e))?;
+    }
+    #[cfg(not(unix))]
+    let _ = (path, mode);
+    Ok(())
+}
+
+/// `dir` and its parent (the store) made if missing, both owner-only.
+fn private_dirs(dir: &Path) -> Result<(), ToolError> {
+    std::fs::create_dir_all(dir).map_err(|e| ToolError::io(dir.display(), e))?;
+    if let Some(store) = dir.parent() {
+        owner_only(store, 0o700)?;
+    }
+    owner_only(dir, 0o700)
+}
+
+/// A name no other call in this process (or another) is using right now.
+fn unique(prefix: &str) -> String {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
+    format!("{prefix}-{}-{}-{nanos}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+}
 
 /// Copy the saved profile `from` into the empty folder `to`, skipping caches and lock files and
 /// never following a link (links are left out). Going over a cap is an error, not a partial copy.
 pub fn copy_profile(from: &Path, to: &Path, caps: &CopyCaps) -> Result<(), ToolError> {
     let over = |what: String| {
-        ToolError::new(ErrorCode::OverLimit, format!("The saved sign-in is too big to use: {what}."))
-            .with_remediation(format!("Forget it with {SIGN_OUT_TOOL} and sign in again with {SIGN_IN_TOOL}."))
+        ToolError::new(ErrorCode::OverLimit, format!("The sign-in profile is too big to copy: {what}.")).with_remediation(format!(
+            "Forget the saved sign-in with {SIGN_OUT_TOOL} and sign in again with {SIGN_IN_TOOL}, visiting only the site you want to study."
+        ))
     };
     let (mut bytes, mut files) = (0u64, 0u64);
     let mut stack: Vec<(PathBuf, PathBuf, usize)> = vec![(from.to_path_buf(), to.to_path_buf(), 0)];
@@ -231,7 +317,11 @@ pub fn copy_profile(from: &Path, to: &Path, caps: &CopyCaps) -> Result<(), ToolE
                 if depth.saturating_add(1) > caps.max_depth {
                     return Err(over(format!("its folders go deeper than {} levels", caps.max_depth)));
                 }
-                std::fs::create_dir(&target).map_err(|e| ToolError::io(target.display(), e))?;
+                files = files.saturating_add(1);
+                if files > caps.max_files {
+                    return Err(over(format!("more than {} files and folders", caps.max_files)));
+                }
+                private_dir(&target)?;
                 stack.push((path, target, depth.saturating_add(1)));
             } else if meta.is_file() {
                 if SKIPPED_FILES.contains(&name_str.as_ref()) {
@@ -240,12 +330,13 @@ pub fn copy_profile(from: &Path, to: &Path, caps: &CopyCaps) -> Result<(), ToolE
                 files = files.saturating_add(1);
                 bytes = bytes.saturating_add(meta.len());
                 if files > caps.max_files {
-                    return Err(over(format!("more than {} files", caps.max_files)));
+                    return Err(over(format!("more than {} files and folders", caps.max_files)));
                 }
                 if bytes > caps.max_bytes {
                     return Err(over(format!("more than {} MiB", caps.max_bytes >> 20)));
                 }
                 std::fs::copy(&path, &target).map_err(|e| ToolError::io(path.display(), e))?;
+                owner_only(&target, 0o600)?;
             }
         }
     }
@@ -287,11 +378,11 @@ impl Ended {
     }
 }
 
-/// On Linux a window needs a desktop session; without one (a server, a remote shell) say so
+/// On Linux and the other Unix systems (not macOS) a window needs a desktop session; without one (a server, a remote shell) say so
 /// before anything starts.
 fn no_display_error(display: Option<String>, wayland: Option<String>) -> Option<ToolError> {
     let has = |v: Option<String>| v.is_some_and(|s| !s.trim().is_empty());
-    (cfg!(target_os = "linux") && !has(display) && !has(wayland)).then(|| {
+    (cfg!(all(unix, not(target_os = "macos"))) && !has(display) && !has(wayland)).then(|| {
         ToolError::new(ErrorCode::NotSupported, "There's no desktop here to open a sign-in window on.")
             .with_remediation(format!("Run {SIGN_IN_TOOL} from Craft Anything on a computer with a screen (the app, or the CLI in a desktop session). Websites still open without signing in."))
     })
@@ -335,13 +426,22 @@ fn web_site_sign_in(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Tool
             return Err(e.with_remediation(fix));
         }
     };
+    let mut browser = browser;
     let env = browser_env(ctx.session.clean_room(), &browser);
     let started = Instant::now();
-    let ended = wait_for_close(&browser.endpoint, Duration::from_secs(p.timeout_secs), &ctx.cancel);
-    close_politely(&browser);
-    let kept = browser.profile_dir().map(|p| keep_profile(p, &dir)).unwrap_or_else(|| Err(ToolError::internal("the sign-in browser had no profile")));
+    let Some(profile) = browser.profile_dir().map(Path::to_path_buf) else {
+        return Err(ToolError::internal("the sign-in browser had no profile"));
+    };
+    let ended = wait_for_close(&browser.endpoint, &profile, Duration::from_secs(p.timeout_secs), &ctx.cancel);
+    // The profile is copied only once the browser has gone: it writes its cookies as it exits.
+    let killed = !close_and_wait(&mut browser, &profile);
+    let kept = keep_profile(&profile, &dir);
     drop(browser);
     kept?;
+    // Open the site once more the way web_site_open will, to see whether the sign-in was kept.
+    ctx.report(None, format!("Checking that {key} opens signed in…"));
+    let checked = check_saved(ctx, &url, &dir);
+    let (check, check_note) = check_result(checked);
     let saved_at = now_secs();
     let record = json!({"version": RECORD_VERSION, "site": key, "saved_at": saved_at});
     let bytes = serde_json::to_vec_pretty(&record).map_err(|e| ToolError::internal(e.to_string()))?;
@@ -354,24 +454,35 @@ fn web_site_sign_in(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Tool
     };
     let mut ev = EvidenceBuilder::new(SIGN_IN_TOOL, Subject { kind: "website".into(), sha256: None, name: Some(key.clone()) }, env)
         .params(json!({"site": key, "timeout_secs": p.timeout_secs}))
-        .result(json!({"site": key, "saved": true, "saved_at": saved_at, "ended": ended.id(), "waited_secs": waited, "replaced_earlier": had}))
+        .result(json!({"site": key, "saved": true, "saved_at": saved_at, "ended": ended.id(), "waited_secs": waited, "replaced_earlier": had, "check": check}))
         .summary(summary)
         .confidence(Confidence::Observed)
         .authority(Authority::OurRun)
         .limitation(Limitation::new(
             "not_checked",
-            "Craft Anything never sees your password and never reads cookie or storage values, so it can't tell whether you finished signing in: the next opened page shows it.",
+            "Craft Anything never sees your password and never reads cookie or storage values: whether you finished signing in is judged only by opening the site once more (`check`).",
         ))
         .limitation(Limitation::new(
-            "session_only",
-            "A site that keeps you signed in only until the browser closes (no \"remember me\") isn't kept: like any browser, it forgets that sign-in when the window closes. Choose to stay signed in if the site offers it.",
+            "session_cookies",
+            "Sign-ins that last only while the browser is open (no \"remember me\") are kept too, but a site may still end them sooner than a remembered one.",
+        ))
+        .limitation(Limitation::new(
+            "kept_here",
+            format!("The sign-in is kept in Craft Anything's folder on this computer: anyone who can open your files here could use it. Every later web_site_open of {key} uses it until {SIGN_OUT_TOOL} forgets it."),
         ))
         .limitation(Limitation::new(
             "exact_site",
-            format!("Used only for pages on {key} (that exact host and port), until the site ends the sign-in or {SIGN_OUT_TOOL} forgets it."),
+            format!("It's used only when that exact host and port is opened, but it may also hold the sign-ins of other sites you passed through while signing in (a single sign-on provider). It lasts until the site ends it or {SIGN_OUT_TOOL} forgets it."),
         ))
         .coverage(Coverage::complete(1))
         .location(Location::new("site", key.clone()));
+    ev = ev.limitations(check_note);
+    if killed {
+        ev = ev.limitation(Limitation::new(
+            "browser_stopped",
+            "The browser didn't finish closing by itself and was stopped, so the latest part of the sign-in may not have been saved. If pages open signed out, sign in again.",
+        ));
+    }
     if ended != Ended::Closed {
         ev = ev.limitation(Limitation::new(
             "window_stopped",
@@ -381,27 +492,193 @@ fn web_site_sign_in(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Tool
     Ok(ToolOutput::evidence(ev.build()?))
 }
 
-/// Copy the closed sign-in browser's profile into `dir/profile`, replacing an earlier one only
-/// once the new copy is complete.
-fn keep_profile(from: &Path, dir: &Path) -> Result<(), ToolError> {
-    std::fs::create_dir_all(dir).map_err(|e| ToolError::io(dir.display(), e))?;
-    let staging = dir.join("profile.new");
-    let _ = std::fs::remove_dir_all(&staging);
-    std::fs::create_dir(&staging).map_err(|e| ToolError::io(staging.display(), e))?;
-    if let Err(e) = copy_profile(from, &staging, &CopyCaps::default()) {
-        let _ = std::fs::remove_dir_all(&staging);
-        return Err(e);
-    }
-    let profile = dir.join(PROFILE_DIR);
-    if std::fs::symlink_metadata(&profile).is_ok() {
-        std::fs::remove_dir_all(&profile).map_err(|e| ToolError::io(profile.display(), e))?;
-    }
-    std::fs::rename(&staging, &profile).map_err(|e| ToolError::io(profile.display(), e))
+/// Where the check's picture of the page goes: the site's own sign-in folder, owner-only, never
+/// a place that's committed or sent on (it shows the person's own account).
+const CHECK_PICTURE: &str = "check.png";
+
+/// What opening the site with the just-saved sign-in showed.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Checked {
+    /// The page still asks for a password (the same test as a capture's `sign_in_page`).
+    pub sign_in_page: bool,
+    /// Where it ended up, without query or fragment.
+    pub url: String,
+    /// The picture: its path, sha256, width and height.
+    pub picture: Value,
 }
 
-/// Wait until the person closes the browser: it stops answering, or its last page is gone.
-fn wait_for_close(endpoint: &cdp::Endpoint, wait: Duration, cancel: &CancelToken) -> Ended {
+/// Does a form on the page ask for a password? (A capture's `sign_in_page` reads the same
+/// field types from its form outline.)
+const PASSWORD_JS: &str =
+    "Array.from(document.forms).some(f => Array.from(f.elements).some(e => e.type === 'password')) || !!document.querySelector('input[type=password]')";
+
+/// Open `url` headless with a copy of the sign-in saved in `dir`, as web_site_open does, and look.
+fn check_saved(ctx: &mut Ctx<'_>, url: &str, dir: &Path) -> Result<Checked, ToolError> {
+    let dl = Deadline::new(Duration::from_secs(45), ctx.cancel.clone());
+    let opts = LaunchOptions { profile: ProfileChoice::SeededFrom(dir.join(PROFILE_DIR)), ..LaunchOptions::default() };
+    let browser = Browser::launch(ctx, &opts, &dl)?;
+    let targets = cdp::json_list(&browser.endpoint, &dl)?;
+    let target = web_common::pick_target(&targets, None, Some("page"))?;
+    let mut client = web_common::connect_target(&browser, target, craft_anything_engines::cdp::PAGE_MAX_MESSAGE, &dl)?;
+    let r = (|| -> Result<(String, bool, Vec<u8>), ToolError> {
+        super::website_tools::navigate(&mut client, url, 1280, 900, 1500, &dl)?;
+        let here = super::website_tools::eval(&mut client, "location.href", &dl)?.as_str().unwrap_or_default().to_string();
+        let password = super::website_tools::eval(&mut client, PASSWORD_JS, &dl)? == Value::Bool(true);
+        let shot = client.call("Page.captureScreenshot", json!({"format": "png"}), None, &dl)?;
+        let data = shot.get("data").and_then(Value::as_str).ok_or_else(|| ToolError::new(ErrorCode::GarbledOutput, "the browser returned no screenshot"))?;
+        Ok((here, password, web_common::b64_decode(data)?))
+    })();
+    super::browser_tools::cleanup(&mut client, &dl);
+    drop(browser);
+    let (here, sign_in_page, png) = r?;
+    let (width, height) = web_common::png_dimensions(&png)?;
+    let path = dir.join(CHECK_PICTURE);
+    crate::project::write_atomic(&path, &png)?;
+    owner_only(&path, 0o600)?;
+    let picture =
+        json!({"path": path.display().to_string(), "sha256": craft_anything_evidence::sha256_hex(&png), "width": width, "height": height, "bytes": png.len()});
+    Ok(Checked { sign_in_page, url: super::website_tools::shown_url(&here), picture })
+}
+
+/// The check as a typed result (`done`, `sign_in_page`, `url`, `picture`, `error`) and what it
+/// means for the person. A check that couldn't run never fails the sign-in or discards it.
+pub(crate) fn check_result(r: Result<Checked, ToolError>) -> (Value, Vec<Limitation>) {
+    match r {
+        Ok(c) => {
+            let mut notes = vec![Limitation::new(
+                "check_picture",
+                format!(
+                    "{} is a picture of the site opened with your sign-in, so it shows your own account. It stays in Craft Anything's folder on this computer and is deleted by {SIGN_OUT_TOOL}.",
+                    c.picture["path"].as_str().unwrap_or(CHECK_PICTURE)
+                ),
+            )];
+            if c.sign_in_page {
+                notes.push(Limitation::new(
+                    "sign_in_not_kept",
+                    "Opened with the saved sign-in, the site may still be asking you to sign in (it shows a password field), so the sign-in may not have been kept: some sites tie a sign-in to the browser it was made in. Sign in again and tick \"remember me\" or \"stay signed in\" if the site offers it.",
+                ));
+            }
+            (json!({"done": true, "sign_in_page": c.sign_in_page, "url": c.url, "picture": c.picture, "error": null}), notes)
+        }
+        Err(e) => (
+            json!({"done": false, "sign_in_page": null, "url": null, "picture": null, "error": e.message}),
+            vec![Limitation::new(
+                "not_checked_after",
+                format!(
+                    "The sign-in was saved, but opening the site again to check it didn't work ({}), so whether it opens signed in isn't known yet.",
+                    e.message
+                ),
+            )],
+        ),
+    }
+}
+
+/// Copy the closed sign-in browser's profile into `dir/profile`. The copy is made under a name of
+/// its own and swapped in only when complete (the old one is moved aside first, then deleted), so
+/// a failure never leaves half a sign-in, and of two sign-ins saved at once the last to finish
+/// wins. Folders left by an earlier run that stopped part-way are deleted first.
+pub(crate) fn keep_profile(from: &Path, dir: &Path) -> Result<(), ToolError> {
+    private_dirs(dir)?;
+    remove_leftovers(dir);
+    let staging = dir.join(unique("profile.new"));
+    private_dir(&staging)?;
+    if let Err(e) = copy_profile(from, &staging, &CopyCaps::default()) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(e.with_remediation(format!(
+            "Sign in again with {SIGN_IN_TOOL}, visiting only the site you want to study, and close the window when you're signed in."
+        )));
+    }
+    let profile = dir.join(PROFILE_DIR);
+    let old = dir.join(unique("profile.old"));
+    let moved_aside = std::fs::rename(&profile, &old).is_ok();
+    if let Err(e) = std::fs::rename(&staging, &profile) {
+        let _ = std::fs::remove_dir_all(&staging);
+        if moved_aside {
+            let _ = std::fs::rename(&old, &profile);
+        }
+        return Err(ToolError::io(profile.display(), e));
+    }
+    if moved_aside {
+        let _ = std::fs::remove_dir_all(&old);
+    }
+    Ok(())
+}
+
+/// Delete `profile.new-*` and `profile.old-*` folders a run that stopped part-way left in `dir`.
+/// A sign-in being saved right now may lose its copy and fail; it never damages a saved one.
+fn remove_leftovers(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let leftover = name.starts_with("profile.new-") || name.starts_with("profile.old-");
+        if leftover && std::fs::symlink_metadata(e.path()).is_ok_and(|m| m.is_dir()) {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+}
+
+/// The browser holding `profile` has exited: it removes its profile lock as the last step of
+/// closing, after writing cookies (`SingletonLock` on Unix; on Windows `lockfile` stays locked
+/// until then).
+fn profile_released(profile: &Path) -> bool {
+    if cfg!(windows) {
+        let lock = profile.join("lockfile");
+        std::fs::symlink_metadata(&lock).is_err() || std::fs::remove_file(&lock).is_ok()
+    } else {
+        std::fs::symlink_metadata(profile.join("SingletonLock")).is_err()
+    }
+}
+
+fn profile_locked(profile: &Path) -> bool {
+    if cfg!(windows) { profile.join("lockfile").exists() } else { std::fs::symlink_metadata(profile.join("SingletonLock")).is_ok() }
+}
+
+/// What one look at the sign-in browser saw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Look {
+    /// It has exited (its profile lock is gone).
+    Exited,
+    /// It didn't answer.
+    Silent,
+    /// It answered with no page open.
+    NoPages,
+    Open,
+}
+
+/// Looks in a row that mean the window was closed: the browser exited (once is enough, when its
+/// lock was seen while it ran), or it went silent or showed no pages in every look for 2 s (one
+/// slow answer, or a moment between pages while signing in, isn't a close).
+#[derive(Debug, Default)]
+struct CloseWatch {
+    since: Option<Instant>,
+    looks: u32,
+}
+
+impl CloseWatch {
+    const LOOKS: u32 = 3;
+    const SPAN: Duration = Duration::from_secs(2);
+
+    fn closed(&mut self, look: Look, now: Instant) -> bool {
+        match look {
+            Look::Exited => true,
+            Look::Open => {
+                *self = CloseWatch::default();
+                false
+            }
+            Look::Silent | Look::NoPages => {
+                let since = *self.since.get_or_insert(now);
+                self.looks = self.looks.saturating_add(1);
+                self.looks >= Self::LOOKS && now.saturating_duration_since(since) >= Self::SPAN
+            }
+        }
+    }
+}
+
+/// Wait until the person closes the browser, the time is up or the call is stopped.
+fn wait_for_close(endpoint: &cdp::Endpoint, profile: &Path, wait: Duration, cancel: &CancelToken) -> Ended {
     let started = Instant::now();
+    let mut watch = CloseWatch::default();
+    let mut lock_seen = false;
     loop {
         if cancel.is_cancelled() {
             return Ended::Cancelled;
@@ -409,32 +686,43 @@ fn wait_for_close(endpoint: &cdp::Endpoint, wait: Duration, cancel: &CancelToken
         if started.elapsed() >= wait {
             return Ended::TimedOut;
         }
+        lock_seen |= profile_locked(profile);
         let probe = Deadline::new(Duration::from_secs(3), CancelToken::default());
-        match cdp::json_list(endpoint, &probe) {
-            Err(_) => return Ended::Closed,
-            Ok(targets) if !targets.iter().any(|t| t.get("type").and_then(Value::as_str) == Some("page")) => return Ended::Closed,
-            Ok(_) => {}
+        let look = if lock_seen && profile_released(profile) {
+            Look::Exited
+        } else {
+            match cdp::json_list(endpoint, &probe) {
+                Err(_) => Look::Silent,
+                Ok(targets) if !targets.iter().any(|t| t.get("type").and_then(Value::as_str) == Some("page")) => Look::NoPages,
+                Ok(_) => Look::Open,
+            }
+        };
+        if watch.closed(look, Instant::now()) {
+            return Ended::Closed;
         }
-        std::thread::sleep(Duration::from_millis(500));
+        std::thread::sleep(Duration::from_millis(700));
     }
 }
 
-/// Ask a browser that's still running to close, so it writes its sign-in to disk, and give it a
-/// moment; dropping the `Browser` afterwards stops whatever is left.
-fn close_politely(browser: &Browser) {
+/// Ask the browser to close if it's still running, so it writes its sign-in to disk, and wait
+/// (at most 20 s) until it has exited. One that doesn't is stopped; returns false then.
+fn close_and_wait(browser: &mut Browser, profile: &Path) -> bool {
     let dl = Deadline::new(Duration::from_secs(5), CancelToken::default());
-    let Ok(version) = cdp::json_version(&browser.endpoint, &dl) else { return };
-    if let Ok(mut client) = web_common::connect_target(browser, &version, 1 << 20, &dl) {
+    if let Ok(version) = cdp::json_version(&browser.endpoint, &dl)
+        && let Ok(mut client) = web_common::connect_target(browser, &version, 1 << 20, &dl)
+    {
         let _ = client.call("Browser.close", json!({}), None, &dl);
     }
-    let until = Instant::now() + Duration::from_secs(10);
+    let until = Instant::now() + Duration::from_secs(20);
     while Instant::now() < until {
         let probe = Deadline::new(Duration::from_secs(1), CancelToken::default());
-        if cdp::json_version(&browser.endpoint, &probe).is_err() {
-            return;
+        if profile_released(profile) && cdp::json_version(&browser.endpoint, &probe).is_err() {
+            return true;
         }
         std::thread::sleep(Duration::from_millis(200));
     }
+    browser.stop_and_wait(Duration::from_secs(10));
+    false
 }
 
 // ---------------------------------------------------------------------------------------------
