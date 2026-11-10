@@ -4524,6 +4524,11 @@ fn the_brief_says_signed_in_only_when_the_capture_was() {
     for deep in [false, true] {
         assert!(brief(&ws, "website", deep, false, None, false, None).contains(super::brief::SIGNED_IN_NOTE), "deep: {deep}");
     }
+    // A saved sign-in the site had ended: the page still asks for a password.
+    std::fs::write(&capture, br#"{"signed_in": true, "sign_in_page": true}"#).unwrap();
+    for deep in [false, true] {
+        assert!(!brief(&ws, "website", deep, false, None, false, None).contains(super::brief::SIGNED_IN_NOTE), "deep: {deep}");
+    }
     std::fs::write(&capture, b"garbage").unwrap();
     assert!(!brief(&ws, "website", false, false, None, false, None).contains(super::brief::SIGNED_IN_NOTE));
 }

@@ -24,12 +24,6 @@ pub const STATES_DIR: &str = "states";
 pub const HOW_TO_RUN: &str = "Craft Anything serves your built folder itself, so the site needs no dev or start script here. For anyone running it without Craft Anything, write app/README.md saying how: the commands that build it (such as `npm install` and `npm run build`, or none for plain files) and the folder to serve with any static web server (for example `npx serve dist`), since opening index.html straight from the disk may not work.";
 
 /// The folder for the states opened at a phone `width`: `states-390`.
-/// The study captured the site signed in, with the person's saved sign-in (`capture.json`'s
-/// typed `signed_in`, #1178).
-pub fn captured_signed_in(ws: &Workspace) -> bool {
-    read_json(&ws.capture_dir().join("capture.json")).and_then(|c| c.get("signed_in").and_then(Value::as_bool)).unwrap_or(false)
-}
-
 pub fn phone_states_dir(width: u32) -> String {
     format!("{STATES_DIR}-{width}")
 }
@@ -684,6 +678,15 @@ pub fn pair_states<'a>(original: &'a Value, built: &'a Value) -> Vec<(&'a Value,
         (s.get("kind").and_then(Value::as_str).unwrap_or_default().to_string(), label)
     };
     rows(original).map(|o| (o, rows(built).find(|b| key(b) == key(o)))).collect()
+}
+
+/// The study captured the site signed in, with the person's saved sign-in, and the page wasn't
+/// still asking for a password (`capture.json`'s typed `signed_in` and `sign_in_page`, #1178): a
+/// sign-in the site had ended shows its sign-in page, which isn't the signed-in view.
+pub fn captured_signed_in(ws: &Workspace) -> bool {
+    let Some(c) = read_json(&ws.capture_dir().join("capture.json")) else { return false };
+    let yes = |k: &str| c.get(k).and_then(Value::as_bool).unwrap_or(false);
+    yes("signed_in") && !yes("sign_in_page")
 }
 
 /// Read a JSON file, or None.
