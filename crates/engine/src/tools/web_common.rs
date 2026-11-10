@@ -32,12 +32,39 @@ pub struct LaunchOptions {
     pub no_sandbox: bool,
     /// Seconds to wait for a launched browser to start listening.
     pub startup_secs: u64,
+    /// Which profile a launched browser uses.
+    pub profile: ProfileChoice,
+    /// The page a launched browser starts on (default `about:blank`).
+    pub start_url: Option<String>,
+    /// Its profile is copied out afterwards as a saved sign-in (cookies kept with a key every
+    /// later launch can read).
+    pub keeps_sign_in: bool,
 }
 
 impl Default for LaunchOptions {
     fn default() -> Self {
-        LaunchOptions { allow_launch: true, headless: true, no_sandbox: false, startup_secs: 30 }
+        LaunchOptions {
+            allow_launch: true,
+            headless: true,
+            no_sandbox: false,
+            startup_secs: 30,
+            profile: ProfileChoice::Fresh,
+            start_url: None,
+            keeps_sign_in: false,
+        }
     }
+}
+
+/// The profile a launched browser gets.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ProfileChoice {
+    /// A new empty private profile, deleted when the browser is dropped.
+    #[default]
+    Fresh,
+    /// A new private profile filled with a copy of a saved sign-in first (see
+    /// [`super::site_sign_in::copy_profile`]); deleted when the browser is dropped, so the saved
+    /// sign-in is never changed.
+    SeededFrom(std::path::PathBuf),
 }
 
 /// A connected browser: its loopback endpoint and product info. If we launched it, the owned
@@ -140,6 +167,11 @@ fn snap_in_script(script: &[u8]) -> Option<std::path::PathBuf> {
 
 impl Browser {
     /// A handle to a browser someone else owns (it is not killed when this drops).
+    /// The profile folder of a browser we launched (deleted when this is dropped).
+    pub(crate) fn profile_dir(&self) -> Option<&std::path::Path> {
+        self._profile.as_ref().map(|p| p.0.as_path())
+    }
+
     pub fn attached(endpoint: &Endpoint, product: &str, version: &str) -> Browser {
         Browser {
             endpoint: endpoint.clone(),
@@ -190,9 +222,16 @@ impl Browser {
                     .with_remediation(format!("{fix} Or give a loopback CDP endpoint (start a browser with --remote-debugging-port)."))
             })?;
         let exe = snap_behind(&exe).unwrap_or(exe);
-        let profile = BrowserProfile(super::artifact_tools::fresh_dir_in(&profile_base(&exe, dirs::home_dir()), "craft-browser")?);
+        // Always a profile of our own where this browser can reach it (a Snap's or Flatpak's
+        // folder, #747), so a saved sign-in is only ever copied in and out, never used in place.
+        let owned = BrowserProfile(super::artifact_tools::fresh_dir_in(&profile_base(&exe, dirs::home_dir()), "craft-browser")?);
+        if let ProfileChoice::SeededFrom(saved) = &opts.profile {
+            // On error the half-filled copy is removed as `owned` drops.
+            super::site_sign_in::copy_profile(saved, &owned.0, &super::site_sign_in::CopyCaps::default())?;
+        }
+        let (profile_dir, profile) = (owned.0.clone(), Some(owned));
         let mut args: Vec<String> = vec![
-            format!("--user-data-dir={}", profile.0.display()),
+            format!("--user-data-dir={}", profile_dir.display()),
             "--remote-debugging-port=0".into(),
             "--remote-allow-origins=*".into(),
             "--no-first-run".into(),
@@ -209,7 +248,12 @@ impl Browser {
         if opts.no_sandbox {
             args.push("--no-sandbox".into());
         }
-        args.push("about:blank".into());
+        // A saved sign-in is made in a window and read later without one: on Linux both launches
+        // must keep cookies with the same key, so neither asks the desktop's keyring.
+        if cfg!(target_os = "linux") && (opts.profile != ProfileChoice::Fresh || opts.keeps_sign_in) {
+            args.push("--password-store=basic".into());
+        }
+        args.push(opts.start_url.clone().unwrap_or_else(|| "about:blank".into()));
         let cancel = ctx.cancel.clone();
         let tail = StderrTail::default();
         let sink = tail.clone();
@@ -224,7 +268,7 @@ impl Browser {
             .hands_off()
             .spawn()?;
         let name = exe.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "the browser".into());
-        let endpoint = Self::await_devtools(&profile.0, dl, &mut proc, &tail, &name)?;
+        let endpoint = Self::await_devtools(&profile_dir, dl, &mut proc, &tail, &name)?;
         let version = cdp::json_version(&endpoint, dl)?;
         Ok(Browser {
             product: version.get("Browser").and_then(Value::as_str).unwrap_or("unknown").to_string(),
@@ -232,9 +276,9 @@ impl Browser {
             user_agent: version.get("User-Agent").and_then(Value::as_str).unwrap_or_default().to_string(),
             endpoint,
             launched: true,
-            _watch: craft_anything_platform::end_with_this_process(&proc, Some(&profile.0)),
+            _watch: craft_anything_platform::end_with_this_process(&proc, profile.as_ref().map(|p| p.0.as_path())),
             _proc: Some(proc),
-            _profile: Some(profile),
+            _profile: profile,
         })
     }
 

@@ -159,7 +159,7 @@ pub(crate) fn resolve_browser(
     no_sandbox: bool,
     dl: &Deadline,
 ) -> Result<Browser, ToolError> {
-    let opts = LaunchOptions { allow_launch: launch, headless, no_sandbox, startup_secs: 30 };
+    let opts = LaunchOptions { allow_launch: launch, headless, no_sandbox, ..LaunchOptions::default() };
     Browser::resolve(ctx, endpoint, &opts, dl)
 }
 

@@ -66,6 +66,8 @@ pub mod web_common;
 pub mod browser_tools;
 // Websites as targets: a browser this session starts, page capture for rebuilding.
 pub mod website_tools;
+// Saved sign-ins for websites, made by the person in a visible window.
+pub mod site_sign_in;
 // A stand-in backend answering a rebuilt front end from a network recording.
 pub mod standin_tools;
 pub mod window_tools;
@@ -123,6 +125,7 @@ pub fn all() -> Vec<crate::ToolSpec> {
     v.extend(web_tools::specs());
     v.extend(browser_tools::specs());
     v.extend(website_tools::specs());
+    v.extend(site_sign_in::specs());
     v.extend(standin_tools::specs());
     v.extend(interaction_tools::specs());
     v.extend(project_tools::specs());

@@ -110,6 +110,10 @@ pub const TOOLS: &[&str] = &[
     "web_page_screenshot_take",
     "web_pixels_compare",
     "web_site_close",
+    // Signing in as yourself in a visible window, and forgetting that sign-in: still a user's view
+    // from outside (a policy call; drop these two lines to make them Deep-only).
+    "web_site_sign_in",
+    "web_site_sign_out",
     // Checks a script's form; it touches no target and starts no browser.
     "web_walkthrough_check",
     // A program watched from outside: its window, the controls on its screen, a recorded run.

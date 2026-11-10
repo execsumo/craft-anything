@@ -10,7 +10,8 @@
 use super::artifact_tools::{create_absent_dir, write_new_file};
 use super::browser_tools::{browser_env, cleanup, deadline};
 use super::native_common::spec;
-use super::web_common::{self, Browser, LaunchOptions};
+use super::site_sign_in;
+use super::web_common::{self, Browser, LaunchOptions, ProfileChoice};
 use crate::tool::{Caller, Ctx, Effects, Requires, ToolOutput, ToolSpec, Toolset, parse_params, schema_of};
 use craft_anything_engines::cdp::{self, CdpClient, CdpEvent, Deadline, Endpoint, PAGE_MAX_MESSAGE};
 use craft_anything_evidence::{Authority, Confidence, Coverage, ErrorCode, EvidenceBuilder, Limitation, Location, Subject, ToolError, sha256_hex};
@@ -27,7 +28,7 @@ pub fn specs() -> Vec<ToolSpec> {
         spec(
             "web_site_open",
             "Open a website",
-            "Load a web page (http/https) in a private browser owned by this session (fresh profile, no history or logins) at a chosen window size, wait for it to finish loading, and report its final address, title and size. Every browser tool then inspects this page unless given another endpoint. Runs the site's scripts, so it needs your approval.",
+            "Load a web page (http/https) in a private browser owned by this session (fresh profile, no history or logins) at a chosen window size, wait for it to finish loading, and report its final address, title and size. When web_site_sign_in saved a sign-in for that exact site, the private profile starts with a copy of it (signed_in: false opens signed out; true requires one). Every browser tool then inspects this page unless given another endpoint. Runs the site's scripts, so it needs your approval.",
             "Open a website in a private, hidden browser so it can be studied.",
             Toolset::Browser,
             Effects::EVIDENCE.union(Effects::EXECUTES_FOREIGN_CODE).union(Effects::ACCESSES_NETWORK).union(Effects::LAUNCHES_PROCESS),
@@ -80,6 +81,8 @@ pub struct SiteBrowser {
     pub url: Mutex<String>,
     /// What went wrong while the last page opened ([`page_health`]); web_site_capture records it.
     pub health: Mutex<Value>,
+    /// The site key whose saved sign-in this browser started with; `None`: a fresh private profile.
+    pub signed_in: Option<String>,
     _owner: Mutex<Browser>,
 }
 
@@ -112,6 +115,10 @@ pub struct OpenParams {
     pub headless: bool,
     #[serde(default = "d_timeout")]
     pub timeout_secs: u64,
+    /// Use the sign-in saved for this site by web_site_sign_in. Unset: use it when one is saved;
+    /// false: a fresh private profile; true: it must be saved (an error otherwise).
+    #[serde(default)]
+    pub signed_in: Option<bool>,
 }
 
 fn d_width() -> u32 {
@@ -152,11 +159,19 @@ fn web_site_open(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolErr
         return Err(ToolError::invalid("width must be 320..=3840 and height 320..=4000"));
     }
     let dl = deadline(ctx, p.timeout_secs)?;
-    let site = match live_site(ctx, &dl) {
+    let saved = chosen_sign_in(ctx.session, &url, p.signed_in)?;
+    let want = saved.as_ref().map(|s| s.key.clone());
+    // A browser started for another sign-in (or none) isn't reused: each site sees only its own.
+    let reuse = live_site(ctx, &dl).filter(|s| s.signed_in == want);
+    if reuse.is_none() {
+        ctx.session.ext.remove::<SiteBrowser>();
+    }
+    let site = match reuse {
         Some(s) => s,
         None => {
-            ctx.report(None, "Starting a private browser…");
-            let opts = LaunchOptions { allow_launch: true, headless: p.headless, no_sandbox: false, startup_secs: 30 };
+            ctx.report(None, if want.is_some() { "Starting a private browser with your saved sign-in…" } else { "Starting a private browser…" });
+            let profile = saved.as_ref().map_or(ProfileChoice::Fresh, |s| ProfileChoice::SeededFrom(s.profile.clone()));
+            let opts = LaunchOptions { headless: p.headless, profile, ..LaunchOptions::default() };
             let b = Browser::launch(ctx, &opts, &dl)?;
             let site = Arc::new(SiteBrowser {
                 endpoint: b.endpoint.clone(),
@@ -164,6 +179,7 @@ fn web_site_open(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolErr
                 version: b.version.clone(),
                 url: Mutex::new(String::new()),
                 health: Mutex::new(Value::Null),
+                signed_in: want.clone(),
                 _owner: Mutex::new(b),
             });
             ctx.session.ext.insert(site.clone());
@@ -194,7 +210,8 @@ fn web_site_open(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolErr
     };
     let title = facts.get("title").and_then(Value::as_str).unwrap_or_default().to_string();
     let shown = shown_url(&final_url);
-    let opened = if title.is_empty() { format!("Opened {shown}.") } else { format!("Opened {shown}: \"{title}\".") };
+    let how = if want.is_some() { " signed in" } else { "" };
+    let opened = if title.is_empty() { format!("Opened {shown}{how}.") } else { format!("Opened {shown}{how}: \"{title}\".") };
     let count = |k: &str| health.get(k).and_then(Value::as_array).map_or(0, Vec::len);
     let summary = match (count("errors"), count("failed_requests")) {
         (0, 0) => opened,
@@ -207,15 +224,46 @@ fn web_site_open(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolErr
         browser_env(ctx.session.clean_room(), &browser),
     )
     .params(json!({"url": shown, "width": p.width, "height": p.height}))
-    .result(json!({"url": final_url, "title": title, "facts": facts, "health": health, "browser": site.product}))
+    .result(json!({"url": final_url, "title": title, "facts": facts, "health": health, "browser": site.product, "signed_in": want.is_some(), "signed_in_site": want}))
     .summary(summary)
     .confidence(Confidence::Observed)
     .authority(Authority::OurRun)
-    .limitation(Limitation::new("private_profile", "A fresh private browser: pages behind a login show their signed-out state."))
+    .limitation(profile_limitation(want.as_deref()))
     .coverage(Coverage::complete(1))
     .location(Location::new("url", shown))
     .build()?;
     Ok(ToolOutput::evidence(ev))
+}
+
+/// The saved sign-in `web_site_open` starts with for `url`: the one saved for its exact site,
+/// unless `signed_in` is false. `true` with none saved is an error naming the tool that saves one.
+fn chosen_sign_in(session: &crate::session::Session, url: &str, signed_in: Option<bool>) -> Result<Option<site_sign_in::SavedSignIn>, ToolError> {
+    if signed_in == Some(false) {
+        return Ok(None);
+    }
+    let key = site_sign_in::site_key(url);
+    let saved = key.as_ref().ok().and_then(|k| site_sign_in::saved(session, k));
+    if signed_in == Some(true) && saved.is_none() {
+        let site = key.unwrap_or_else(|_| shown_url(url));
+        return Err(ToolError::new(ErrorCode::NotFound, format!("No sign-in is saved for {site}.")).with_remediation(format!(
+            "Sign in once with {} (it opens a window where you sign in yourself), then open the site again.",
+            site_sign_in::SIGN_IN_TOOL
+        )));
+    }
+    Ok(saved)
+}
+
+/// What the opened pages' browser profile means for what they show.
+fn profile_limitation(signed_in: Option<&str>) -> Limitation {
+    match signed_in {
+        Some(site) => Limitation::new(
+            "signed_in",
+            format!(
+                "Opened signed in with your saved sign-in for {site}: screenshots and page text may show your own account's data. If the site has ended that sign-in since, pages show their signed-out state."
+            ),
+        ),
+        None => Limitation::new("private_profile", "A fresh private browser: pages behind a login show their signed-out state."),
+    }
 }
 
 /// The session's website browser when it is still answering; a dead one is dropped.
@@ -827,6 +875,13 @@ fn web_site_capture(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Tool
     } else if let (Value::Object(b), Ok(h)) = (&mut blueprint, site.health.lock()) {
         b.insert("health".into(), h.clone());
     }
+    let signed_in = site.signed_in.is_some();
+    let sign_in_page = !signed_in && has_password_field(&blueprint);
+    if let Value::Object(b) = &mut blueprint {
+        b.insert("signed_in".into(), json!(signed_in));
+        b.insert("signed_in_site".into(), json!(site.signed_in));
+        b.insert("sign_in_page".into(), json!(sign_in_page));
+    }
 
     let url = blueprint.get("url").and_then(Value::as_str).unwrap_or_default().to_string();
     let shown = shown_url(&url);
@@ -858,6 +913,9 @@ fn web_site_capture(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Tool
             "counts": {"outline": n("outline"), "headings": n("headings"), "links": n("links"), "forms": n("forms"), "images": images},
             "design": blueprint.get("design"),
             "files": ["README.md", "capture.json"],
+            "signed_in": signed_in,
+            "signed_in_site": site.signed_in,
+            "sign_in_page": sign_in_page,
         }))
         .summary(summary)
         .confidence(Confidence::Observed)
@@ -869,11 +927,26 @@ fn web_site_capture(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Tool
             Limitation::new("cross_origin_css", "CSS custom properties and breakpoints from cross-origin stylesheets can't be read.")
         })
         .limitations(html_cut(html))
+        .limitations(site.signed_in.as_deref().map(|s| profile_limitation(Some(s))))
+        .limitations(sign_in_page.then(|| Limitation::new("sign_in_page", SIGN_IN_HINT)))
         .coverage(Coverage::complete(p.widths.len() as u64))
         .location(Location::new("url", shown))
         .location(Location::new("path", out.display().to_string()))
         .build()?;
     Ok(ToolOutput::evidence(ev))
+}
+
+/// Said when a page captured signed out asks for a password.
+const SIGN_IN_HINT: &str = "This looks like a sign-in page. To study what's behind it, sign in once with web_site_sign_in and capture again.";
+
+/// The page asks for a password: a field of type password in its forms or its outline.
+fn has_password_field(blueprint: &Value) -> bool {
+    let password = |f: &Value| f.get("type").and_then(Value::as_str) == Some("password");
+    let in_forms = blueprint
+        .get("forms")
+        .and_then(Value::as_array)
+        .is_some_and(|forms| forms.iter().any(|f| f.get("fields").and_then(Value::as_array).is_some_and(|fields| fields.iter().any(password))));
+    in_forms || blueprint.get("outline").and_then(Value::as_array).is_some_and(|items| items.iter().any(password))
 }
 
 /// The blueprint, the screenshots, and the HTML's bytes as (saved, the page's).
@@ -1033,6 +1106,14 @@ fn readme(b: &Value, shots: &[Value], (html_bytes, html_total): (usize, usize), 
         b.pointer("/page/w").and_then(Value::as_u64).unwrap_or(0),
         b.pointer("/page/h").and_then(Value::as_u64).unwrap_or(0)
     ));
+    if b.get("signed_in") == Some(&Value::Bool(true)) {
+        md.push_str(&format!(
+            "Captured signed in, with the person's saved sign-in for {}: this is the site as they see it when signed in, and the pictures and text may show their own account's data.\n\n",
+            s("/signed_in_site")
+        ));
+    } else if b.get("sign_in_page") == Some(&Value::Bool(true)) {
+        md.push_str(&format!("{SIGN_IN_HINT}\n\n"));
+    }
     md.push_str("## Files\n\n");
     for sh in shots {
         md.push_str(&format!(
@@ -1235,6 +1316,30 @@ mod tests {
         assert!(!md.contains("secret=1"), "query strings are not echoed");
         assert!(md.contains("no width breakpoints"), "{md}");
         assert!(!md.contains("cut at the size limit") && html_cut((10, 10)).is_none());
+    }
+
+    /// #1178: a page captured signed out that asks for a password suggests signing in; a signed-in
+    /// capture says it shows the person's own view, and never suggests it.
+    #[test]
+    fn a_sign_in_page_and_a_signed_in_capture_are_said() {
+        let login = json!({"forms": [{"fields": [{"tag": "input", "type": "email"}, {"tag": "input", "type": "password"}]}]});
+        assert!(has_password_field(&login));
+        assert!(has_password_field(&json!({"outline": [{"tag": "input", "type": "password"}]})));
+        assert!(!has_password_field(&json!({"forms": [{"fields": [{"type": "search"}]}], "outline": [{"tag": "a"}]})));
+        assert!(!has_password_field(&json!({"forms": "garbage", "outline": 3})));
+        let page = |extra: Value| {
+            let mut b = json!({"url": "https://ex.com/", "title": "Ex", "page": {"w": 1440, "h": 900}});
+            if let (Value::Object(b), Value::Object(e)) = (&mut b, extra) {
+                b.extend(e);
+            }
+            readme(&b, &[], (0, 0), true)
+        };
+        assert!(page(json!({"signed_in": false, "sign_in_page": true})).contains(SIGN_IN_HINT));
+        let signed = page(json!({"signed_in": true, "signed_in_site": "ex.com", "sign_in_page": false}));
+        assert!(signed.contains("Captured signed in") && signed.contains("ex.com") && !signed.contains(SIGN_IN_HINT), "{signed}");
+        assert!(!page(json!({})).contains("signed in"));
+        assert!(profile_limitation(Some("ex.com")).message.contains("your own account"));
+        assert_eq!(profile_limitation(None).code, "private_profile");
     }
 
     /// #336: HTML cut at the size limit is said in the evidence and the README.

@@ -31,5 +31,14 @@ pub fn session() -> Session {
 pub fn live_session() -> Session {
     let mut s = session();
     s.settings.engines.only_configured = false;
+    live_browser(&mut s);
     s
+}
+
+/// `CRAFT_ANYTHING_TEST_CHROMIUM`, when set, is the browser live tests use (one the usual search
+/// doesn't find, or can't start in a test shell).
+pub fn live_browser(s: &mut Session) {
+    if let Some(exe) = std::env::var_os("CRAFT_ANYTHING_TEST_CHROMIUM") {
+        s.settings.engines.tools.chromium = Some(PathBuf::from(exe));
+    }
 }
