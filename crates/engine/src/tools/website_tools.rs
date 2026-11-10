@@ -83,6 +83,8 @@ pub struct SiteBrowser {
     pub health: Mutex<Value>,
     /// The site key whose saved sign-in this browser started with; `None`: a fresh private profile.
     pub signed_in: Option<String>,
+    /// Revision of the saved profile copied at launch; `None` for a fresh profile.
+    pub sign_in_revision: Option<String>,
     _owner: Mutex<Browser>,
 }
 
@@ -152,6 +154,7 @@ pub(crate) fn shown_url(url: &str) -> String {
     web_common::sanitize_url(url).split(['?', '#']).next().unwrap_or_default().to_string()
 }
 
+/// Open a page, reusing a live browser only when its requested profile still matches.
 fn web_site_open(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
     let p: OpenParams = parse_params(params)?;
     let url = check_url(&p.url)?.to_string();
@@ -163,7 +166,8 @@ fn web_site_open(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolErr
     let want = saved.as_ref().map(|s| s.key.clone());
     // A browser started for another sign-in (or none) isn't reused: each site sees only its own.
     // The new one replaces it once it has started, so a failed start leaves the old one open.
-    let reuse = live_site(ctx, &dl).filter(|s| s.signed_in == want);
+    let revision = saved.as_ref().map(|s| s.revision.clone());
+    let reuse = live_site(ctx, &dl).filter(|s| reuse_profile(p.signed_in, s.signed_in.as_deref(), s.sign_in_revision.as_deref(), saved.as_ref()));
     let site = match reuse {
         Some(s) => s,
         None => {
@@ -178,6 +182,7 @@ fn web_site_open(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolErr
                 url: Mutex::new(String::new()),
                 health: Mutex::new(Value::Null),
                 signed_in: want.clone(),
+                sign_in_revision: revision,
                 _owner: Mutex::new(b),
             });
             ctx.session.ext.insert(site.clone());
@@ -233,6 +238,11 @@ fn web_site_open(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolErr
     .location(Location::new("url", shown))
     .build()?;
     Ok(ToolOutput::evidence(ev))
+}
+
+/// Explicit signed-out opens must discard even a matching browser's accumulated state.
+fn reuse_profile(requested: Option<bool>, key: Option<&str>, revision: Option<&str>, saved: Option<&site_sign_in::SavedSignIn>) -> bool {
+    requested != Some(false) && key == saved.map(|s| s.key.as_str()) && revision == saved.map(|s| s.revision.as_str())
 }
 
 /// The saved sign-in `web_site_open` starts with for `url`: the one saved for its exact site,
@@ -1291,6 +1301,27 @@ fn web_site_close(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolEr
 
 #[cfg(test)]
 mod tests {
+    /// Reuse requires the same saved key and revision, and never an explicit fresh profile.
+    #[test]
+    fn profile_reuse_requires_current_revision_and_no_explicit_fresh_request() {
+        let saved = super::site_sign_in::SavedSignIn {
+            key: "site-example.com_443".into(),
+            profile: std::path::PathBuf::from("profile"),
+            saved_at: 1,
+            revision: "second".into(),
+        };
+        for requested in [None, Some(true)] {
+            assert!(super::reuse_profile(requested, Some(&saved.key), Some("second"), Some(&saved)));
+            assert!(!super::reuse_profile(requested, Some(&saved.key), Some("first"), Some(&saved)));
+            assert!(!super::reuse_profile(requested, Some("site-other.example_443"), Some("second"), Some(&saved)));
+            assert!(!super::reuse_profile(requested, None, None, Some(&saved)));
+            assert!(!super::reuse_profile(requested, Some(&saved.key), Some("second"), None));
+        }
+        assert!(super::reuse_profile(None, None, None, None));
+        assert!(!super::reuse_profile(Some(false), None, None, None));
+        assert!(!super::reuse_profile(Some(false), Some(&saved.key), Some("second"), Some(&saved)));
+    }
+
     use super::*;
 
     #[test]

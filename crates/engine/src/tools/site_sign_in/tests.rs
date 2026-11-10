@@ -6,24 +6,45 @@ fn granted() -> CallOptions<'static> {
 }
 
 #[test]
-fn a_site_key_is_the_host_and_a_port_that_isnt_the_default() {
+fn a_site_key_is_the_normalized_host_and_effective_port() {
     let k = |u: &str| site_key(u).unwrap();
-    assert_eq!(k("https://Example.COM/path?q=1#x"), "site-example.com");
-    assert_eq!(k("https://example.com:443/"), "site-example.com");
-    assert_eq!(k("http://example.com:80"), "site-example.com");
+    assert_eq!(k("https://Example.COM/path?q=1#x"), "site-example.com_443");
+    assert_eq!(k("https://example.com:443/"), "site-example.com_443");
+    assert_eq!(k("http://example.com:80"), "site-example.com_80");
+    assert_eq!(k("http://example.com"), k("https://EXAMPLE.com.:080"));
+    assert_eq!(k("https://example.com"), k("http://example.com:0443"));
+    assert_ne!(k("http://example.com"), k("https://example.com"));
     assert_eq!(k("http://example.com:443"), "site-example.com_443");
     assert_eq!(k("https://app.example.com:8443/x"), "site-app.example.com_8443");
     assert_eq!(k("http://127.0.0.1:5173/"), "site-127.0.0.1_5173");
     assert_eq!(k("http://[::1]:3000/"), "site-ip6_--1_3000");
-    assert_eq!(k("https://user:pw@example.com/"), "site-example.com", "credentials are not part of the key");
-    assert_eq!(k("https://example.com./"), "site-example.com");
-    assert_eq!(k("https://xn--bcher-kva.example/"), "site-xn--bcher-kva.example", "punycode is a name like any other");
+    assert_eq!(k("https://user:pw@example.com/"), "site-example.com_443", "credentials are not part of the key");
+    assert_eq!(k("https://example.com./"), "site-example.com_443");
+    assert_eq!(k("https://xn--bcher-kva.example/"), "site-xn--bcher-kva.example_443", "punycode is a name like any other");
     assert_ne!(k("https://a.example.com/"), k("https://example.com/"), "exact host only");
     // Names Windows reserves for devices never become a folder name on their own.
-    assert_eq!(k("https://con/"), "site-con");
-    assert_eq!(k("https://nul.example.com/"), "site-nul.example.com");
+    assert_eq!(k("https://con/"), "site-con_443");
+    assert_eq!(k("https://nul.example.com/"), "site-nul.example.com_443");
     assert!(site_key("https://example.com../").is_err(), "only one trailing dot is the same host");
     assert!(site_key(&format!("https://{}.example/", "a".repeat(120))).is_err(), "keys stay short enough for any path");
+}
+
+/// Replacing a record changes its revision even when the display timestamp is unchanged.
+#[test]
+fn saved_profile_revisions_distinguish_same_second_replacements() {
+    let s = crate::testing::session();
+    let key = site_key("https://example.com").unwrap();
+    save_fixture(&s, &key);
+    let record = sign_ins_dir(&s).join(&key).join(RECORD_FILE);
+    let first = unique("saved");
+    let second = unique("saved");
+    assert_ne!(first, second);
+    for revision in [first, second] {
+        std::fs::write(&record, json!({"version": RECORD_VERSION, "site": key, "saved_at": 1, "revision": revision}).to_string()).unwrap();
+        let loaded = saved(&s, &key).unwrap();
+        assert_eq!(loaded.saved_at, 1);
+        assert_eq!(loaded.revision, revision);
+    }
 }
 
 #[test]
@@ -81,7 +102,7 @@ fn save_fixture(session: &Session, key: &str) -> PathBuf {
 #[test]
 fn a_profile_copy_skips_caches_locks_and_links() {
     let s = crate::testing::session();
-    let from = save_fixture(&s, "site-example.com");
+    let from = save_fixture(&s, "site-example.com_443");
     let outside = tempfile::tempdir().unwrap();
     std::fs::write(outside.path().join("secret"), b"not ours").unwrap();
     #[cfg(unix)]
@@ -138,7 +159,7 @@ fn saved_sign_ins_are_owner_only() {
     use std::os::unix::fs::PermissionsExt as _;
     let s = crate::testing::session();
     let from = save_fixture(&s, "site-from.example");
-    let dir = sign_ins_dir(&s).join("site-example.com");
+    let dir = sign_ins_dir(&s).join("site-example.com_443");
     keep_profile(&from, &dir).unwrap();
     let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode(&sign_ins_dir(&s)), 0o700);
@@ -154,7 +175,7 @@ fn saved_sign_ins_are_owner_only() {
 fn a_new_sign_in_replaces_the_old_one_whole() {
     let s = crate::testing::session();
     let first = save_fixture(&s, "site-first.example");
-    let dir = sign_ins_dir(&s).join("site-example.com");
+    let dir = sign_ins_dir(&s).join("site-example.com_443");
     keep_profile(&first, &dir).unwrap();
     std::fs::create_dir_all(dir.join("profile.new-stale")).unwrap();
     std::fs::create_dir_all(dir.join("profile.old-stale")).unwrap();
@@ -166,7 +187,7 @@ fn a_new_sign_in_replaces_the_old_one_whole() {
     assert!(!dir.join(PROFILE_DIR).join("Local State").exists(), "nothing of the old one is mixed in");
     let names: Vec<String> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
     assert_eq!(names, vec![PROFILE_DIR.to_string()], "no staging or old folders are left");
-    assert_eq!(saved(&s, "site-example.com"), None, "no record yet: the tool writes it last");
+    assert_eq!(saved(&s, "site-example.com_443"), None, "no record yet: the tool writes it last");
 }
 
 #[test]
@@ -203,7 +224,7 @@ fn a_check_after_saving_is_typed_and_never_fails_the_sign_in() {
 #[test]
 fn a_profile_copy_over_a_cap_is_refused() {
     let s = crate::testing::session();
-    let from = save_fixture(&s, "site-example.com");
+    let from = save_fixture(&s, "site-example.com_443");
     let refused = |caps: CopyCaps| {
         let to = tempfile::tempdir().unwrap();
         copy_profile(&from, to.path(), &caps).unwrap_err()
@@ -221,12 +242,12 @@ fn a_profile_copy_over_a_cap_is_refused() {
 fn signing_out_forgets_only_that_site_and_nothing_saved_is_fine() {
     let s = crate::testing::session();
     let base = sign_ins_dir(&s);
-    save_fixture(&s, "site-example.com");
+    save_fixture(&s, "site-example.com_443");
     save_fixture(&s, "site-other.example");
     let e = Engine::new(s);
     let out = e.call(SIGN_OUT_TOOL, json!({"url": "https://EXAMPLE.com/account"}), CallOptions::new(Caller::Cli)).unwrap().to_json();
     assert_eq!(out["result"]["removed"], true, "{out}");
-    assert!(!base.join("site-example.com").exists());
+    assert!(!base.join("site-example.com_443").exists());
     assert!(base.join("site-other.example").join(RECORD_FILE).is_file(), "another site's sign-in stays");
     let again = e.call(SIGN_OUT_TOOL, json!({"url": "https://example.com/"}), CallOptions::new(Caller::Cli)).unwrap().to_json();
     assert_eq!(again["result"]["removed"], false);
@@ -242,7 +263,7 @@ fn signing_out_removes_a_link_not_what_it_points_at() {
     std::fs::create_dir_all(&base).unwrap();
     let elsewhere = tempfile::tempdir().unwrap();
     std::fs::write(elsewhere.path().join("keep"), b"x").unwrap();
-    std::os::unix::fs::symlink(elsewhere.path(), base.join("site-example.com")).unwrap();
+    std::os::unix::fs::symlink(elsewhere.path(), base.join("site-example.com_443")).unwrap();
     let out = Engine::new(s).call(SIGN_OUT_TOOL, json!({"url": "https://example.com"}), CallOptions::new(Caller::Cli)).unwrap().to_json();
     assert_eq!(out["result"]["removed"], true);
     assert!(elsewhere.path().join("keep").is_file());
@@ -251,15 +272,15 @@ fn signing_out_removes_a_link_not_what_it_points_at() {
 #[test]
 fn a_saved_sign_in_needs_its_record_and_a_real_profile() {
     let s = crate::testing::session();
-    assert_eq!(saved(&s, "site-example.com"), None);
-    let profile = save_fixture(&s, "site-example.com");
-    assert_eq!(saved(&s, "site-example.com").map(|x| x.profile), Some(profile.clone()));
+    assert_eq!(saved(&s, "site-example.com_443"), None);
+    let profile = save_fixture(&s, "site-example.com_443");
+    assert_eq!(saved(&s, "site-example.com_443").map(|x| x.profile), Some(profile.clone()));
     // A record for another site, or a newer version, isn't used.
-    let record = sign_ins_dir(&s).join("site-example.com").join(RECORD_FILE);
-    std::fs::write(&record, json!({"version": 2, "site": "site-example.com"}).to_string()).unwrap();
-    assert_eq!(saved(&s, "site-example.com"), None);
+    let record = sign_ins_dir(&s).join("site-example.com_443").join(RECORD_FILE);
+    std::fs::write(&record, json!({"version": 2, "site": "site-example.com_443"}).to_string()).unwrap();
+    assert_eq!(saved(&s, "site-example.com_443"), None);
     std::fs::write(&record, json!({"version": 1, "site": "site-other.example"}).to_string()).unwrap();
-    assert_eq!(saved(&s, "site-example.com"), None);
+    assert_eq!(saved(&s, "site-example.com_443"), None);
 }
 
 #[test]
@@ -269,7 +290,7 @@ fn signed_in_true_with_nothing_saved_names_the_sign_in_tool() {
     s.settings.engines.tools.chromium = Some(std::env::current_exe().unwrap());
     let err = Engine::new(s).call("web_site_open", json!({"url": "https://example.com", "signed_in": true}), granted()).unwrap_err();
     assert_eq!(err.code, ErrorCode::NotFound, "{}", err.message);
-    assert!(err.message.contains("site-example.com"), "{}", err.message);
+    assert!(err.message.contains("site-example.com_443"), "{}", err.message);
     assert!(err.remediation.unwrap_or_default().contains(SIGN_IN_TOOL));
 }
 
@@ -319,7 +340,7 @@ fn opening_a_site_with_a_saved_sign_in_starts_from_a_copy() {
     let logs = tempfile::tempdir().unwrap();
     let mut s = crate::testing::session();
     s.settings.engines.tools.chromium = Some(recording_browser(logs.path()));
-    let saved_profile = save_fixture(&s, "site-example.com");
+    let saved_profile = save_fixture(&s, "site-example.com_443");
     let e = Engine::new(s);
     let open = |p: Value| {
         for f in ["args", "profile", "listing"] {

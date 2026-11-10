@@ -1620,6 +1620,9 @@ Gaps found while using the app for real projects.
       #1178. Live with Chromium on Linux against a local test site (virtual display, scripted
       sign-in); a confined Snap or Flatpak browser and a real site were not run
       — claimed: execsumo, branch feature/r2.9-signed-in-website-study
+      Review fixes: saved profiles use normalized host and effective port; browser reuse also
+      checks the saved revision, and explicit `signed_in: false` always starts fresh. Builder
+      guidance treats saved-profile use as unverified authentication, even without a password page.
 - [ ] A "Sign in to this site" button in the Make screen for website targets (`web_site_sign_in`
       is reachable only as a tool, from the CLI, MCP or the agent, today)
 - [ ] Study with the person's own already-running browser through its debugging endpoint, as an

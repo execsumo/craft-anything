@@ -680,9 +680,9 @@ pub fn pair_states<'a>(original: &'a Value, built: &'a Value) -> Vec<(&'a Value,
     rows(original).map(|o| (o, rows(built).find(|b| key(b) == key(o)))).collect()
 }
 
-/// The study captured the site signed in, with the person's saved sign-in, and the page wasn't
-/// still asking for a password (`capture.json`'s typed `signed_in` and `sign_in_page`, #1178): a
-/// sign-in the site had ended shows its sign-in page, which isn't the signed-in view.
+/// The study used a saved profile and detected no password page (`capture.json`'s typed
+/// `signed_in` and `sign_in_page`, #1178). This does not establish authentication: a rejected
+/// session may lead to a public page or a passwordless sign-in step instead.
 pub fn captured_signed_in(ws: &Workspace) -> bool {
     let Some(c) = read_json(&ws.capture_dir().join("capture.json")) else { return false };
     let yes = |k: &str| c.get(k).and_then(Value::as_bool).unwrap_or(false);

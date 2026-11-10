@@ -36,12 +36,13 @@ const MAX_KEY_LEN: usize = 120;
 /// Every key starts with this, so no key is a name Windows reserves (`con`, `nul`, `com1`…).
 const KEY_PREFIX: &str = "site-";
 
+/// Register the tools for saving and forgetting website sign-ins.
 pub fn specs() -> Vec<ToolSpec> {
     vec![
         spec(
             SIGN_IN_TOOL,
             "Sign in to a website",
-            "Open a website in a visible browser window with a profile Craft Anything keeps for that site, and wait until you close the window (or timeout_secs passes, default 600, at most 1800). Sign in there yourself: Craft Anything never sees your password and never reads cookie or storage values. Until you forget it with web_site_sign_out, every later web_site_open of that exact host and port (studies and captures included) starts with a copy of that sign-in, so it sees the pages you see when signed in. The sign-in is kept in Craft Anything's folder on this computer: anyone who can open your files here could use it. When a sign-in is already saved for the site, the window opens with it, and what you leave when you close the window replaces it: to use another account, sign out on the site in the window first, or forget the saved one with web_site_sign_out. Needs a desktop where a window can open.",
+            "Open a website in a visible browser window with a profile Craft Anything keeps for that site, and wait until you close the window (or timeout_secs passes, default 600, at most 1800). Sign in there yourself: Craft Anything never sees your password and never reads cookie or storage values. Until you forget it with web_site_sign_out, later web_site_open calls for that exact host and effective port (studies and captures included) use a copy of that sign-in by default; signed_in: false starts fresh. An expired or rejected session may still open signed out. The sign-in is kept in Craft Anything's folder on this computer: anyone who can open your files here could use it. When a sign-in is already saved for the site, the window opens with it, and what you leave when you close the window replaces it: to use another account, sign out on the site in the window first, or forget the saved one with web_site_sign_out. Needs a desktop where a window can open.",
             "Sign in to a site once yourself, so its pages can be studied as you see them. The sign-in is kept on this computer, and used for that site until you forget it.",
             Toolset::Browser,
             Effects::EVIDENCE
@@ -72,15 +73,15 @@ pub fn specs() -> Vec<ToolSpec> {
 // Site keys and where saved sign-ins live
 
 /// The folder name a site's saved sign-in lives under: `site-` and the URL's host in lower case,
-/// plus `_port` when the port isn't the scheme's default (`site-example.com`,
-/// `site-app.example.com_8443`, `site-127.0.0.1_5173`, `site-ip6_--1` for `[::1]`). Only `a-z`, `0-9`, `-`, `.` and `_` are allowed, so a key is always one
+/// plus its effective `_port` (omitted ports resolve to 80 for HTTP and 443 for HTTPS):
+/// `site-example.com_443`, `site-app.example.com_8443`, `site-ip6_--1_80` for `http://[::1]`. Only `a-z`, `0-9`, `-`, `.` and `_` are allowed, so a key is always one
 /// safe path component; a host with anything else (a Unicode name: give its `xn--` form) is refused,
 /// never rewritten, so two sites can't share a key.
 pub fn site_key(url: &str) -> Result<String, ToolError> {
     let u = check_url(url)?;
     let (rest, default_port) = match u.strip_prefix("https://") {
-        Some(r) => (r, "443"),
-        None => (u.strip_prefix("http://").unwrap_or(u), "80"),
+        Some(r) => (r, 443u16),
+        None => (u.strip_prefix("http://").unwrap_or(u), 80u16),
     };
     let authority = rest.split(['/', '?', '#', '\\']).next().unwrap_or_default();
     // Credentials before the host are never part of the key.
@@ -120,16 +121,10 @@ pub fn site_key(url: &str) -> Result<String, ToolError> {
         return Err(bad());
     }
     let port = match port {
-        None | Some("") => None,
-        Some(p) => {
-            let n: u16 = p.parse().ok().filter(|n| *n != 0 && p.chars().all(|c| c.is_ascii_digit())).ok_or_else(bad)?;
-            (n.to_string() != default_port).then_some(n)
-        }
+        None | Some("") => default_port,
+        Some(p) => p.parse::<u16>().ok().filter(|n| *n != 0 && p.chars().all(|c| c.is_ascii_digit())).ok_or_else(bad)?,
     };
-    let key = match port {
-        Some(n) => format!("{KEY_PREFIX}{host}_{n}"),
-        None => format!("{KEY_PREFIX}{host}"),
-    };
+    let key = format!("{KEY_PREFIX}{host}_{port}");
     if key.len() > MAX_KEY_LEN {
         return Err(bad());
     }
@@ -149,6 +144,8 @@ pub struct SavedSignIn {
     pub profile: PathBuf,
     /// When it was saved, in seconds since 1970.
     pub saved_at: u64,
+    /// Opaque identity of this saved profile, changed on every save.
+    pub revision: String,
 }
 
 /// The sign-in saved for `key`, when there is a complete one (its record and a real profile folder).
@@ -160,7 +157,11 @@ pub fn saved(session: &Session, key: &str) -> Option<SavedSignIn> {
     }
     let profile = dir.join(PROFILE_DIR);
     let meta = std::fs::symlink_metadata(&profile).ok()?;
-    meta.is_dir().then(|| SavedSignIn { key: key.to_string(), profile, saved_at: record.get("saved_at").and_then(Value::as_u64).unwrap_or(0) })
+    meta.is_dir().then(|| {
+        let saved_at = record.get("saved_at").and_then(Value::as_u64).unwrap_or(0);
+        let revision = record.get("revision").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(|| saved_at.to_string());
+        SavedSignIn { key: key.to_string(), profile, saved_at, revision }
+    })
 }
 
 /// Largest `Preferences` file read back before changing it.
@@ -194,6 +195,7 @@ pub fn keep_session_cookies(profile: &Path) -> Result<(), ToolError> {
     crate::project::write_atomic(&path, &bytes)
 }
 
+/// Seconds since the Unix epoch for the saved sign-in's display timestamp.
 fn now_secs() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
@@ -210,6 +212,7 @@ pub struct CopyCaps {
 }
 
 impl Default for CopyCaps {
+    /// Bound profile copies to 512 MiB, 20,000 entries and 16 nested folders.
     fn default() -> Self {
         CopyCaps { max_bytes: 512 << 20, max_files: 20_000, max_depth: 16 }
     }
@@ -356,6 +359,7 @@ pub struct SignInParams {
     pub timeout_secs: u64,
 }
 
+/// Default time allowed for the person to finish signing in.
 fn d_wait() -> u64 {
     600
 }
@@ -369,6 +373,7 @@ enum Ended {
 }
 
 impl Ended {
+    /// Stable result identifier for how the sign-in window ended.
     fn id(self) -> &'static str {
         match self {
             Ended::Closed => "closed",
@@ -388,6 +393,7 @@ fn no_display_error(display: Option<String>, wayland: Option<String>) -> Option<
     })
 }
 
+/// Save the profile left by a visible sign-in window and check it on the site.
 fn web_site_sign_in(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
     let p: SignInParams = parse_params(params)?;
     let url = check_url(&p.url)?.to_string();
@@ -443,12 +449,12 @@ fn web_site_sign_in(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Tool
     let checked = check_saved(ctx, &url, &dir);
     let (check, check_note) = check_result(checked);
     let saved_at = now_secs();
-    let record = json!({"version": RECORD_VERSION, "site": key, "saved_at": saved_at});
+    let record = json!({"version": RECORD_VERSION, "site": key, "saved_at": saved_at, "revision": unique("saved")});
     let bytes = serde_json::to_vec_pretty(&record).map_err(|e| ToolError::internal(e.to_string()))?;
     crate::project::write_atomic(&dir.join(RECORD_FILE), &bytes)?;
     let waited = started.elapsed().as_secs();
     let summary = match ended {
-        Ended::Closed => format!("Saved your sign-in for {key}. Websites opened on {key} now start signed in."),
+        Ended::Closed => format!("Saved your sign-in for {key}. Websites opened on {key} now use it by default, if the site still accepts it."),
         Ended::TimedOut => format!("The sign-in window for {key} was still open after {} s, so it was closed; what it had saved is kept.", p.timeout_secs),
         Ended::Cancelled => format!("Stopped waiting for the sign-in window for {key}; what it had saved is kept."),
     };
@@ -468,7 +474,7 @@ fn web_site_sign_in(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Tool
         ))
         .limitation(Limitation::new(
             "kept_here",
-            format!("The sign-in is kept in Craft Anything's folder on this computer: anyone who can open your files here could use it. Every later web_site_open of {key} uses it until {SIGN_OUT_TOOL} forgets it."),
+            format!("The sign-in is kept in Craft Anything's folder on this computer: anyone who can open your files here could use it. Later web_site_open calls for {key} use it by default until {SIGN_OUT_TOOL} forgets it; signed_in: false starts fresh, and the site may expire or reject the session."),
         ))
         .limitation(Limitation::new(
             "exact_site",
@@ -629,6 +635,7 @@ fn profile_released(profile: &Path) -> bool {
     }
 }
 
+/// Whether the browser has created its platform-specific profile lock.
 fn profile_locked(profile: &Path) -> bool {
     if cfg!(windows) { profile.join("lockfile").exists() } else { std::fs::symlink_metadata(profile.join("SingletonLock")).is_ok() }
 }
@@ -658,6 +665,7 @@ impl CloseWatch {
     const LOOKS: u32 = 3;
     const SPAN: Duration = Duration::from_secs(2);
 
+    /// Confirm an exit immediately, or require repeated missing-page observations over time.
     fn closed(&mut self, look: Look, now: Instant) -> bool {
         match look {
             Look::Exited => true,
@@ -735,6 +743,7 @@ pub struct SignOutParams {
     pub url: String,
 }
 
+/// Forget only the requested site's saved profile, without following a store entry's symlink.
 fn web_site_sign_out(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
     let p: SignOutParams = parse_params(params)?;
     let key = site_key(&p.url)?;

@@ -99,8 +99,8 @@ fn program_from_outside(sees: bool) -> String {
     )
 }
 
-/// Told when the study captured the site signed in (#1178).
-pub(super) const SIGNED_IN_NOTE: &str = "The capture was made with the person's saved sign-in for the site, so it should show the site as they see it when signed in: rebuild those pages, and don't make a sign-in page the thing you build unless their request asks for one. If the pictures show a signed-out page instead, the site had ended the sign-in: say so rather than building that page as the app.";
+/// Explain saved-profile use without treating it as proof of authentication (#1178).
+pub(super) const SIGNED_IN_NOTE: &str = "The capture used the person's saved sign-in profile and no password page was detected. That does not prove the site accepted the session: a public page or passwordless sign-in step may still be signed out. Use the captured evidence and the person's request, not profile use alone, to decide which pages to rebuild. If the intended signed-in view is unclear, ask the person with core_person_ask before building; this also applies when you cannot see the pictures. Don't make a sign-in page the thing you build unless their request asks for one.";
 
 /// The first message to the builder: the request, the evidence, the kind's goal and stack steps,
 /// the shared rules, then the kind's own sections. `extra`: what the person also said.
