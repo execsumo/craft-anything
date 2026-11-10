@@ -1613,7 +1613,7 @@ Gaps found while using the app for real projects.
       to think harder (#1813): Settings → AI and `ai effort` offer its reasoning levels, sent
       only once the person picks one
       — claimed: justinjohn0306, branch bugfix/r2.9-api-reasoning-effort
-- [x] A website study can see what the person sees when signed in (#1178, #1277): the person signs
+- [x] A website study can see what the person sees when signed in: the person signs
       in once in a visible window (`web_site_sign_in`), the saved sign-in is reused by later opens of
       that exact site (copied into the private profile, never changed by a capture), and
       `web_site_sign_out` forgets it; the builder is told when the capture was signed in. Addresses
@@ -1628,6 +1628,8 @@ Gaps found while using the app for real projects.
       Snap Chromium, whose launcher couldn't start in the test shell) and rebuild it signed in
 - [ ] Refresh a saved sign-in from a capture session when the site renews it, so it lasts longer
       than the first sign-in's cookies
+- [ ] Before the builder starts on a signed-in study, show the person the study's first
+      screenshots and ask them to confirm it's the signed-in app (Make screen and an inbox approval)
 
 ### R2.10 Pinned builds
 Owner: maintainers · Status: in progress
