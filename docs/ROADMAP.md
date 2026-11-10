@@ -1613,6 +1613,11 @@ Gaps found while using the app for real projects.
       to think harder (#1813): Settings → AI and `ai effort` offer its reasoning levels, sent
       only once the person picks one
       — claimed: justinjohn0306, branch bugfix/r2.9-api-reasoning-effort
+- [ ] A website study can see what the person sees when signed in (#1178, #1277): the person signs
+      in once in a visible window (`web_site_sign_in`), the saved sign-in is reused by later opens of
+      that exact site (copied into the private profile, never changed by a capture), and
+      `web_site_sign_out` forgets it; the builder is told when the capture was signed in
+      — claimed: execsumo, branch feature/r2.9-signed-in-website-study
 
 ### R2.10 Pinned builds
 Owner: maintainers · Status: in progress
