@@ -74,6 +74,10 @@ pub struct ServerOptions {
 /// Tools that change the machine without an effect that says so.
 const ACTS_ON_MACHINE: [&str; 3] = ["plugins_add", "engines_install", "native_cutter_command_run"];
 
+/// Web tools that act on the person's own desktop and saved sign-ins (a window opens, a sign-in is
+/// kept or deleted): off in restricted mode even with --allow-web.
+const ACTS_ON_DESKTOP: [&str; 2] = ["web_site_sign_in", "web_site_sign_out"];
+
 impl Default for ServerOptions {
     fn default() -> Self {
         ServerOptions {
@@ -360,7 +364,9 @@ impl Server {
         let effects = spec.effects;
         let web = spec.id.starts_with("web_") && effects.intersects(Effects::ACCESSES_NETWORK | Effects::LAUNCHES_PROCESS);
         let capture = web && spec.id.contains("capture");
-        let (off, way_back) = if capture {
+        let (off, way_back) = if ACTS_ON_DESKTOP.contains(&spec.id) {
+            (true, "Start the MCP server without --restricted to sign in to websites.")
+        } else if capture {
             (!self.opts.allow_capture, "Start the MCP server with --allow-capture to turn capture tools on.")
         } else if web {
             (!self.opts.allow_web, "Start the MCP server with --allow-web to turn web tools on.")

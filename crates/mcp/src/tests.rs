@@ -446,6 +446,8 @@ fn restricted_mode_allows_web_and_capture_tools_when_operator_permits() {
     assert!(!names.contains(&"web_page_states_capture".to_string()));
     assert!(!names.contains(&"build_command_run".to_string()));
     assert!(!names.iter().any(|n| n.starts_with("adb_")));
+    // Signing in opens a window on the host's desktop: never with --restricted.
+    assert!(!names.contains(&"web_site_sign_in".to_string()) && !names.contains(&"web_site_sign_out".to_string()));
 
     // With allow_capture
     let opts_cap = ServerOptions { restricted: true, all_tools: true, allow_capture: true, ..Default::default() };
