@@ -1127,7 +1127,7 @@ fn readme(b: &Value, shots: &[Value], (html_bytes, html_total): (usize, usize), 
         md.push_str(&format!("{SIGN_IN_ENDED}\n\n"));
     } else if yes("signed_in") {
         md.push_str(&format!(
-            "Captured signed in, with the person's saved sign-in for {}: this is the site as they see it when signed in, and the pictures and text may show their own account's data.\n\n",
+            "Captured with the person's saved sign-in for {}: if the site still accepted it, this is the site as they see it when signed in, and the pictures and text may show their own account's data.\n\n",
             s("/signed_in_site")
         ));
     } else if yes("sign_in_page") {
@@ -1355,10 +1355,10 @@ mod tests {
         };
         assert!(page(json!({"signed_in": false, "sign_in_page": true})).contains(SIGN_IN_HINT));
         let signed = page(json!({"signed_in": true, "signed_in_site": "ex.com", "sign_in_page": false}));
-        assert!(signed.contains("Captured signed in") && signed.contains("ex.com") && !signed.contains(SIGN_IN_HINT), "{signed}");
+        assert!(signed.contains("Captured with the person's saved sign-in") && signed.contains("ex.com") && !signed.contains(SIGN_IN_HINT), "{signed}");
         assert!(!page(json!({})).contains("signed in"));
         let ended = page(json!({"signed_in": true, "signed_in_site": "ex.com", "sign_in_page": true}));
-        assert!(ended.contains(SIGN_IN_ENDED) && !ended.contains("Captured signed in"), "{ended}");
+        assert!(ended.contains(SIGN_IN_ENDED) && !ended.contains("Captured with the person's saved sign-in"), "{ended}");
         let (u, f) = signed_in_urls("https://ex.com/inbox?code=abc#t".into(), json!({"url": "https://ex.com/inbox?code=abc", "title": "x"}));
         assert_eq!((u.as_str(), f["url"].as_str()), ("https://ex.com/inbox", Some("https://ex.com/inbox")));
         assert!(profile_limitation(Some("ex.com")).message.contains("your own account"));

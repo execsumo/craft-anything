@@ -100,7 +100,7 @@ fn program_from_outside(sees: bool) -> String {
 }
 
 /// Told when the study captured the site signed in (#1178).
-pub(super) const SIGNED_IN_NOTE: &str = "The capture shows the site as the person sees it when signed in to it: rebuild those pages, and don't make a sign-in page the thing you build unless their request asks for one.";
+pub(super) const SIGNED_IN_NOTE: &str = "The capture was made with the person's saved sign-in for the site, so it should show the site as they see it when signed in: rebuild those pages, and don't make a sign-in page the thing you build unless their request asks for one. If the pictures show a signed-out page instead, the site had ended the sign-in: say so rather than building that page as the app.";
 
 /// The first message to the builder: the request, the evidence, the kind's goal and stack steps,
 /// the shared rules, then the kind's own sections. `extra`: what the person also said.
