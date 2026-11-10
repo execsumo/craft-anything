@@ -24,6 +24,12 @@ pub const STATES_DIR: &str = "states";
 pub const HOW_TO_RUN: &str = "Craft Anything serves your built folder itself, so the site needs no dev or start script here. For anyone running it without Craft Anything, write app/README.md saying how: the commands that build it (such as `npm install` and `npm run build`, or none for plain files) and the folder to serve with any static web server (for example `npx serve dist`), since opening index.html straight from the disk may not work.";
 
 /// The folder for the states opened at a phone `width`: `states-390`.
+/// The study captured the site signed in, with the person's saved sign-in (`capture.json`'s
+/// typed `signed_in`, #1178).
+pub fn captured_signed_in(ws: &Workspace) -> bool {
+    read_json(&ws.capture_dir().join("capture.json")).and_then(|c| c.get("signed_in").and_then(Value::as_bool)).unwrap_or(false)
+}
+
 pub fn phone_states_dir(width: u32) -> String {
     format!("{STATES_DIR}-{width}")
 }
@@ -723,7 +729,7 @@ fn states_note(cx: &CheckCx, base: &str, out: &Path, dir: &str, unknowns: &mut V
         return Ok(None);
     }
     let ours = out.join(dir);
-    cx.call("web_site_open", json!({"url": base, "settle_ms": 1200}))?;
+    cx.call("web_site_open", json!({"url": base, "settle_ms": 1200, "signed_in": false}))?;
     // More than the study opened, so the same controls are found even when the build orders them differently.
     let width = original.get("width").and_then(Value::as_u64).unwrap_or(1440);
     if let Err(e) = cx.call("web_page_states_capture", json!({"output_directory": ours.display().to_string(), "max_states": 8, "width": width})) {
@@ -808,7 +814,7 @@ impl Check for WebVisualCheck {
             if let Some(parent) = built.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| ToolError::io(parent.display(), e))?;
             }
-            cx.call("web_site_open", json!({"url": url, "settle_ms": 1200}))?;
+            cx.call("web_site_open", json!({"url": url, "settle_ms": 1200, "signed_in": false}))?;
             cx.call("web_site_capture", json!({"output_directory": built.display().to_string(), "include_html": false, "widths": widths}))?;
             let mut per_width = Vec::new();
             for &w in &widths {

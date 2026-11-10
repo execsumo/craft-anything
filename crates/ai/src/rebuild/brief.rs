@@ -99,6 +99,9 @@ fn program_from_outside(sees: bool) -> String {
     )
 }
 
+/// Told when the study captured the site signed in (#1178).
+pub(super) const SIGNED_IN_NOTE: &str = "The capture shows the site as the person sees it when signed in to it: rebuild those pages, and don't make a sign-in page the thing you build unless their request asks for one.";
+
 /// The first message to the builder: the request, the evidence, the kind's goal and stack steps,
 /// the shared rules, then the kind's own sections. `extra`: what the person also said.
 pub(super) fn brief(kind: &dyn TargetKind, cx: &BriefCx, extra: Option<&str>) -> String {
@@ -127,6 +130,10 @@ pub(super) fn brief(kind: &dyn TargetKind, cx: &BriefCx, extra: Option<&str>) ->
             style = sight(sees, " and open a few of its pictures with the Read tool to learn the style", ""),
         ),
         TargetRef::None => "There is no target to study.".into(),
+    };
+    let capture = match &m.target {
+        TargetRef::Website { .. } if super::kinds::website::captured_signed_in(ws) => format!("{capture}\n\n{SIGNED_IN_NOTE}"),
+        _ => capture,
     };
     let goal = if m.own_project() { "what their request asks of the project in this folder" } else { kind.goal() };
     let mut s = format!(

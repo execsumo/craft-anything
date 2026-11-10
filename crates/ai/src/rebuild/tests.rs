@@ -4504,3 +4504,26 @@ fn a_later_run_opens_the_projects_program_again_for_the_builder() {
         }
     }
 }
+
+/// #1178: both website briefs say the capture is the signed-in view only when the study's
+/// capture.json says it was signed in.
+#[test]
+fn the_brief_says_signed_in_only_when_the_capture_was() {
+    let d = tempfile::tempdir().unwrap();
+    let ws = Workspace::create(d.path(), "Mail", "Clone it", TargetRef::Website { url: "https://mail.example.com/".into() }).unwrap();
+    std::fs::create_dir_all(ws.capture_dir()).unwrap();
+    for deep in [false, true] {
+        assert!(!brief(&ws, "website", deep, false, None, false, None).contains(super::brief::SIGNED_IN_NOTE), "nothing captured yet");
+    }
+    let capture = ws.capture_dir().join("capture.json");
+    std::fs::write(&capture, br#"{"signed_in": false}"#).unwrap();
+    for deep in [false, true] {
+        assert!(!brief(&ws, "website", deep, false, None, false, None).contains(super::brief::SIGNED_IN_NOTE));
+    }
+    std::fs::write(&capture, br#"{"signed_in": true, "signed_in_site": "mail.example.com"}"#).unwrap();
+    for deep in [false, true] {
+        assert!(brief(&ws, "website", deep, false, None, false, None).contains(super::brief::SIGNED_IN_NOTE), "deep: {deep}");
+    }
+    std::fs::write(&capture, b"garbage").unwrap();
+    assert!(!brief(&ws, "website", false, false, None, false, None).contains(super::brief::SIGNED_IN_NOTE));
+}
