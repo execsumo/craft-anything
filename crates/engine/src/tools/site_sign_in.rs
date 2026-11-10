@@ -440,8 +440,9 @@ fn web_site_sign_in(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Tool
     };
     let ended = wait_for_close(&browser.endpoint, &profile, Duration::from_secs(p.timeout_secs), &ctx.cancel);
     // The profile is copied only once the browser has gone: it writes its cookies as it exits.
-    let killed = !close_and_wait(&mut browser, &profile);
-    let kept = keep_profile(&profile, &dir);
+    let closed = close_and_wait(&mut browser, &profile);
+    let killed = closed == BrowserClosed::Stopped;
+    let kept = keep_closed_profile(closed, &profile, &dir);
     drop(browser);
     kept?;
     // Open the site once more the way web_site_open will, to see whether the sign-in was kept.
@@ -712,9 +713,32 @@ fn wait_for_close(endpoint: &cdp::Endpoint, profile: &Path, wait: Duration, canc
     }
 }
 
+/// How the sign-in browser ended, as far as we could confirm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserClosed {
+    /// It exited by itself and released its profile.
+    Itself,
+    /// It didn't finish closing, so it was stopped, and the stop was confirmed.
+    Stopped,
+    /// It was still running after being stopped: its profile may still be changing.
+    Unconfirmed,
+}
+
+/// Copy the sign-in browser's profile into `dir` only when the browser is confirmed gone. A
+/// browser that may still be writing would leave a half-written copy that replaces the earlier
+/// sign-in, so then nothing is copied, the earlier one stays as it was, and the save fails.
+fn keep_closed_profile(closed: BrowserClosed, from: &Path, dir: &Path) -> Result<(), ToolError> {
+    if closed == BrowserClosed::Unconfirmed {
+        return Err(ToolError::unavailable("The sign-in window wouldn't close, so its sign-in wasn't saved.")
+            .with_remediation(format!("Close the window yourself, then run {SIGN_IN_TOOL} again. Any sign-in saved before is unchanged.")));
+    }
+    keep_profile(from, dir)
+}
+
 /// Ask the browser to close if it's still running, so it writes its sign-in to disk, and wait
-/// (at most 20 s) until it has exited. One that doesn't is stopped; returns false then.
-fn close_and_wait(browser: &mut Browser, profile: &Path) -> bool {
+/// (at most 20 s) until it has exited. One that doesn't is stopped, and the result says whether
+/// that stop was confirmed.
+fn close_and_wait(browser: &mut Browser, profile: &Path) -> BrowserClosed {
     let dl = Deadline::new(Duration::from_secs(5), CancelToken::default());
     if let Ok(version) = cdp::json_version(&browser.endpoint, &dl)
         && let Ok(mut client) = web_common::connect_target(browser, &version, 1 << 20, &dl)
@@ -725,12 +749,11 @@ fn close_and_wait(browser: &mut Browser, profile: &Path) -> bool {
     while Instant::now() < until {
         let probe = Deadline::new(Duration::from_secs(1), CancelToken::default());
         if profile_released(profile) && cdp::json_version(&browser.endpoint, &probe).is_err() {
-            return true;
+            return BrowserClosed::Itself;
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    browser.stop_and_wait(Duration::from_secs(10));
-    false
+    if browser.stop_and_wait(Duration::from_secs(10)) { BrowserClosed::Stopped } else { BrowserClosed::Unconfirmed }
 }
 
 // ---------------------------------------------------------------------------------------------

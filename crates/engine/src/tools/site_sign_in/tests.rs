@@ -190,6 +190,25 @@ fn a_new_sign_in_replaces_the_old_one_whole() {
     assert_eq!(saved(&s, "site-example.com_443"), None, "no record yet: the tool writes it last");
 }
 
+/// A browser that may still be running is never copied: the earlier sign-in stays whole and the
+/// save fails instead of reporting success.
+#[test]
+fn an_unconfirmed_browser_stop_keeps_the_earlier_sign_in() {
+    let s = crate::testing::session();
+    let first = save_fixture(&s, "site-first.example");
+    let dir = sign_ins_dir(&s).join("site-example.com_443");
+    keep_profile(&first, &dir).unwrap();
+    let before = snapshot(&dir);
+    let second = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(second.path().join("Default")).unwrap();
+    std::fs::write(second.path().join("Default/Cookies"), b"half-written").unwrap();
+    let e = keep_closed_profile(BrowserClosed::Unconfirmed, second.path(), &dir).unwrap_err();
+    assert!(e.message.contains("wasn't saved"), "{}", e.message);
+    assert_eq!(snapshot(&dir), before, "the earlier sign-in is untouched");
+    keep_closed_profile(BrowserClosed::Stopped, second.path(), &dir).unwrap();
+    assert_eq!(std::fs::read(dir.join(PROFILE_DIR).join("Default/Cookies")).unwrap(), b"half-written");
+}
+
 #[test]
 fn a_window_counts_as_closed_only_when_it_stays_closed() {
     let t0 = Instant::now();
