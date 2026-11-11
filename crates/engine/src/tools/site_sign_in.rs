@@ -136,6 +136,25 @@ pub fn sign_ins_dir(session: &Session) -> PathBuf {
     session.config_dir().join("sign-ins")
 }
 
+/// Reserve one site's saved profile without waiting while another tool holds the session.
+pub(crate) fn lock_site(session: &Session, key: &str) -> Result<std::fs::File, ToolError> {
+    // Keep lock files outside deletable profiles; unlinking them could split the reservation.
+    let directory = sign_ins_dir(session).join(".locks");
+    private_dirs(&directory)?;
+    let path = directory.join(format!("{key}.lock"));
+    let file =
+        std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path).map_err(|error| ToolError::io(path.display(), error))?;
+    owner_only(&path, 0o600)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            Err(ToolError::new(ErrorCode::TimedOut, format!("Another browser operation is using the saved sign-in for {key}."))
+                .with_remediation("Close that site's sign-in window or wait for its browser operation to finish, then try again."))
+        }
+        Err(std::fs::TryLockError::Error(error)) => Err(ToolError::io(path.display(), error)),
+    }
+}
+
 /// A sign-in saved for one site.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SavedSignIn {
@@ -404,6 +423,7 @@ fn web_site_sign_in(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Tool
     if let Some(e) = no_display_error(std::env::var("DISPLAY").ok(), std::env::var("WAYLAND_DISPLAY").ok()) {
         return Err(e);
     }
+    let _reservation = lock_site(ctx.session, &key)?;
     let dir = sign_ins_dir(ctx.session).join(&key);
     let earlier = saved(ctx.session, &key);
     let had = earlier.is_some();
@@ -582,8 +602,8 @@ pub(crate) fn check_result(r: Result<Checked, ToolError>) -> (Value, Vec<Limitat
 
 /// Copy the closed sign-in browser's profile into `dir/profile`. The copy is made under a name of
 /// its own and swapped in only when complete (the old one is moved aside first, then deleted), so
-/// a failure never leaves half a sign-in, and of two sign-ins saved at once the last to finish
-/// wins. Folders left by an earlier run that stopped part-way are deleted first.
+/// a failure never leaves half a sign-in. The caller holds the site's reservation, so folders
+/// left by an earlier run that stopped part-way can be deleted first.
 pub(crate) fn keep_profile(from: &Path, dir: &Path) -> Result<(), ToolError> {
     private_dirs(dir)?;
     remove_leftovers(dir);
@@ -612,7 +632,7 @@ pub(crate) fn keep_profile(from: &Path, dir: &Path) -> Result<(), ToolError> {
 }
 
 /// Delete `profile.new-*` and `profile.old-*` folders a run that stopped part-way left in `dir`.
-/// A sign-in being saved right now may lose its copy and fail; it never damages a saved one.
+/// The caller holds the site's reservation, so no other save can still be using these folders.
 fn remove_leftovers(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for e in entries.flatten() {
@@ -770,6 +790,7 @@ pub struct SignOutParams {
 fn web_site_sign_out(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
     let p: SignOutParams = parse_params(params)?;
     let key = site_key(&p.url)?;
+    let _reservation = lock_site(ctx.session, &key)?;
     let dir = sign_ins_dir(ctx.session).join(&key);
     let removed = match std::fs::symlink_metadata(&dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,

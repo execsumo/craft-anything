@@ -31,7 +31,11 @@ pub fn specs() -> Vec<ToolSpec> {
             "Load a web page (http/https) in a private browser owned by this session (fresh profile, no history or logins) at a chosen window size, wait for it to finish loading, and report its final address, title and size. When web_site_sign_in saved a sign-in for that exact site, the private profile starts with a copy of it (signed_in: false opens signed out; true requires one). Every browser tool then inspects this page unless given another endpoint. Runs the site's scripts, so it needs your approval.",
             "Open a website in a private, hidden browser so it can be studied.",
             Toolset::Browser,
-            Effects::EVIDENCE.union(Effects::EXECUTES_FOREIGN_CODE).union(Effects::ACCESSES_NETWORK).union(Effects::LAUNCHES_PROCESS),
+            Effects::EVIDENCE
+                .union(Effects::EXECUTES_FOREIGN_CODE)
+                .union(Effects::ACCESSES_NETWORK)
+                .union(Effects::LAUNCHES_PROCESS)
+                .union(Effects::WRITES_FILESYSTEM),
             Requires::Engine("chromium"),
             schema_of::<OpenParams>,
             web_site_open,
@@ -163,6 +167,9 @@ fn web_site_open(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolErr
     }
     let dl = deadline(ctx, p.timeout_secs)?;
     let saved = chosen_sign_in(ctx.session, &url, p.signed_in)?;
+    let reservation = saved.as_ref().map(|s| site_sign_in::lock_site(ctx.session, &s.key)).transpose()?;
+    // Re-read under the reservation: a different engine may have replaced or forgotten it.
+    let saved = if reservation.is_some() { chosen_sign_in(ctx.session, &url, p.signed_in)? } else { saved };
     let want = saved.as_ref().map(|s| s.key.clone());
     // A browser started for another sign-in (or none) isn't reused: each site sees only its own.
     // The new one replaces it once it has started, so a failed start leaves the old one open.
@@ -189,6 +196,7 @@ fn web_site_open(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolErr
             site
         }
     };
+    drop(reservation);
     ctx.report(None, format!("Loading {url}…"));
     let mut client = page_client(&site, &dl)?;
     let r = navigate(&mut client, &url, p.width, p.height, p.settle_ms, &dl).and_then(|health| Ok((health, page_facts(&mut client, &dl)?)));

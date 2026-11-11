@@ -257,6 +257,54 @@ fn a_profile_copy_over_a_cap_is_refused() {
     assert!(deep.message.contains("deeper"), "{}", deep.message);
 }
 
+/// Public pages with no saved profile do not need a writable sign-in store.
+#[cfg(unix)]
+#[test]
+fn opening_without_a_saved_profile_does_not_create_reservations() {
+    let logs = tempfile::tempdir().unwrap();
+    let mut session = crate::testing::session();
+    session.settings.engines.tools.chromium = Some(recording_browser(logs.path()));
+    std::fs::write(sign_ins_dir(&session), b"not a directory").unwrap();
+    let e = Engine::new(session);
+    let err = e.call("web_site_open", json!({"url": "https://example.com"}), granted()).unwrap_err();
+    assert!(err.message.contains("closed after"), "a public page reaches browser startup: {}", err.message);
+    assert!(!std::fs::read_to_string(logs.path().join("listing")).unwrap().contains("Cookies"));
+}
+
+/// Overlapping engines must not delete or seed from a profile while a sign-in is using it.
+#[test]
+fn same_site_operations_fail_fast_but_other_sites_and_fresh_opens_are_free() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Session::isolated(dir.path());
+    s.settings.deep_mode = true;
+    s.settings.engines.only_configured = true;
+    s.settings.engines.tools.chromium = Some(std::env::current_exe().unwrap());
+    save_fixture(&s, "site-example.com_443");
+    let held = lock_site(&s, "site-example.com_443").unwrap();
+    let e = Engine::new(s);
+    assert_eq!(lock_site(&e.session(), "site-example.com_443").unwrap_err().code, ErrorCode::TimedOut);
+    assert!(lock_site(&e.session(), "site-other.example_443").is_ok());
+    for id in [SIGN_OUT_TOOL, "web_site_open"] {
+        let err = e.call(id, json!({"url": "https://example.com"}), granted()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::TimedOut, "{id}: {}", err.message);
+        assert!(err.remediation.unwrap_or_default().contains("window"));
+    }
+    #[cfg(unix)]
+    {
+        let logs = tempfile::tempdir().unwrap();
+        e.session().settings.engines.tools.chromium = Some(recording_browser(logs.path()));
+        let fresh = e.call("web_site_open", json!({"url": "https://example.com", "signed_in": false}), granted()).unwrap_err();
+        assert!(fresh.message.contains("closed after"), "fresh requests reach browser startup: {}", fresh.message);
+        assert!(!std::fs::read_to_string(logs.path().join("listing")).unwrap().contains("Cookies"));
+    }
+    assert!(e.call(SIGN_OUT_TOOL, json!({"url": "https://other.example"}), granted()).is_ok());
+    let profile = dir.path().join("sign-ins/site-example.com_443/profile");
+    assert!(profile.join("Default/Cookies").is_file(), "a refused sign-out keeps the saved profile");
+    drop(held);
+    assert!(e.call(SIGN_OUT_TOOL, json!({"url": "https://example.com"}), granted()).is_ok());
+    assert!(!profile.exists());
+}
+
 #[test]
 fn signing_out_forgets_only_that_site_and_nothing_saved_is_fine() {
     let s = crate::testing::session();

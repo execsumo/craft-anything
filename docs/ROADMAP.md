@@ -1623,6 +1623,8 @@ Gaps found while using the app for real projects.
       Review fixes: saved profiles use normalized host and effective port; browser reuse also
       checks the saved revision, and explicit `signed_in: false` always starts fresh. Builder
       guidance treats saved-profile use as unverified authentication, even without a password page.
+      The interactive sign-in runs without holding the engine session lock; same-site profile
+      operations fail fast while reserved, without blocking other sites or explicitly fresh opens.
 - [ ] A "Sign in to this site" button in the Make screen for website targets (`web_site_sign_in`
       is reachable only as a tool, from the CLI, MCP or the agent, today)
 - [ ] Study with the person's own already-running browser through its debugging endpoint, as an

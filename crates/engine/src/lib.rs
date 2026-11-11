@@ -282,10 +282,26 @@ impl Engine {
             }
         }
         let run = spec.run;
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut ctx = Ctx { tool: spec.id, session: &mut session, cancel: opts.cancel.clone(), progress: opts.progress, caller: opts.caller };
-            run(&mut ctx, params)
-        }));
+        let invoke = |session: &mut Session| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut ctx = Ctx { tool: spec.id, session, cancel: opts.cancel.clone(), progress: opts.progress, caller: opts.caller };
+                run(&mut ctx, params)
+            }))
+        };
+        let result = if spec.id == tools::site_sign_in::SIGN_IN_TOOL {
+            // Sign-in needs launch settings, not exclusive access to the person's live session.
+            let mut isolated = Session::isolated(&session.config_dir());
+            isolated.settings = session.settings.clone();
+            isolated.deep_for_run = session.deep_for_run;
+            drop(session);
+            let result = invoke(&mut isolated);
+            // Even a cancelled sign-in can return evidence of what the browser saved.
+            session = self.session();
+            session.label(spec.id);
+            result
+        } else {
+            invoke(&mut session)
+        };
         let output = match result {
             Ok(r) => r?,
             Err(panic) => {
@@ -304,6 +320,90 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Replace only the browser callback; authorization and dispatch remain the real path.
+    fn sign_in_engine(run: tool::ToolFn) -> std::sync::Arc<Engine> {
+        let mut session = crate::testing::session();
+        session.settings.engines.tools.chromium = Some(std::env::current_exe().unwrap());
+        let mut specs = tools::all();
+        specs.iter_mut().find(|s| s.id == tools::site_sign_in::SIGN_IN_TOOL).unwrap().run = run;
+        std::sync::Arc::new(Engine { registry: Registry::new(specs), session: Mutex::new(session) })
+    }
+
+    #[test]
+    fn sign_in_wait_leaves_session_available_and_records_even_after_stop() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        };
+        use std::time::{Duration, Instant};
+        fn waiting(ctx: &mut Ctx<'_>, _: Value) -> Result<ToolOutput, ToolError> {
+            assert!(ctx.session.settings.deep_mode);
+            assert!(ctx.session.settings.engines.tools.chromium.is_some());
+            assert!(ctx.session.project.is_none());
+            assert!(ctx.session.ext.get::<EngineRef>().is_none());
+            ctx.report(None, "waiting for the person");
+            assert!(ctx.cancel.is_cancelled());
+            ctx.session.settings.deep_mode = false;
+            let forget = tools::site_sign_in::specs().into_iter().find(|s| s.id == tools::site_sign_in::SIGN_OUT_TOOL).unwrap();
+            (forget.run)(ctx, serde_json::json!({"url": "https://example.com"}))
+        }
+        let e = sign_in_engine(waiting);
+        let config = e.session().config_dir();
+        let release = Arc::new(AtomicBool::new(false));
+        let gate = release.clone();
+        let (started, entered) = mpsc::channel();
+        let cancel = CancelToken::default();
+        let stop = cancel.clone();
+        let worker = e.clone();
+        let sign_in = std::thread::spawn(move || {
+            let progress = move |_: Progress| {
+                started.send(()).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !gate.load(Ordering::Acquire) && Instant::now() < deadline {
+                    std::thread::park_timeout(Duration::from_millis(5));
+                }
+            };
+            worker.call(
+                tools::site_sign_in::SIGN_IN_TOOL,
+                Value::Null,
+                CallOptions::new(Caller::Cli).with_consent(Consent::Granted).with_cancel(cancel).with_progress(&progress),
+            )
+        });
+        let waiting = entered.recv_timeout(Duration::from_secs(5));
+        let worker = e.clone();
+        let (sent, received) = mpsc::channel();
+        let other = std::thread::spawn(move || {
+            let result = worker.call("core_session_show", Value::Null, CallOptions::new(Caller::Cli));
+            let _ = sent.send(result);
+        });
+        let concurrent = received.recv_timeout(Duration::from_secs(2));
+        stop.cancel();
+        release.store(true, Ordering::Release);
+        let output = sign_in.join().unwrap().unwrap();
+        other.join().unwrap();
+        waiting.unwrap();
+        concurrent.expect("another tool must complete before sign-in is released").unwrap();
+        let ToolOutput::Evidence(ev) = output else { panic!("expected saved evidence") };
+        let session = e.session();
+        assert_eq!(session.config_dir(), config);
+        assert!(session.settings.deep_mode, "the snapshot must not overwrite live settings");
+        assert_eq!(session.ledger().filter(|record| record.id == ev.id).count(), 1);
+    }
+
+    #[test]
+    fn isolated_sign_in_still_requires_consent_and_contains_panics() {
+        fn broken(_: &mut Ctx<'_>, _: Value) -> Result<ToolOutput, ToolError> {
+            panic!("stand-in browser bug");
+        }
+        let e = sign_in_engine(broken);
+        let refused = e.call(tools::site_sign_in::SIGN_IN_TOOL, Value::Null, CallOptions::new(Caller::Cli)).unwrap_err();
+        assert_eq!(refused.code, ErrorCode::ConsentRequired);
+        let failed = e.call(tools::site_sign_in::SIGN_IN_TOOL, Value::Null, CallOptions::new(Caller::Cli).with_consent(Consent::Granted)).unwrap_err();
+        assert_eq!(failed.code, ErrorCode::Internal);
+        assert!(e.call("core_session_show", Value::Null, CallOptions::new(Caller::Cli)).is_ok());
+    }
 
     #[test]
     fn unknown_tool_is_an_error_not_a_panic() {
