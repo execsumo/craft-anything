@@ -112,6 +112,10 @@ impl Availability {
 pub struct Engine {
     registry: Registry,
     session: Mutex<Session>,
+    /// Sign-in evidence that couldn't reach the ledger because Stop came while another tool held
+    /// the session, with the project root it belongs to. Taken in whenever the session is next
+    /// locked (see [`Engine::settle`]). Locked only briefly, and never while waiting for the session.
+    pending: Mutex<Vec<(Option<std::path::PathBuf>, craft_anything_evidence::Evidence)>>,
 }
 
 /// A handle to the engine a tool runs in, for tools that start work which calls back into it (a
@@ -120,7 +124,7 @@ pub struct EngineRef(pub std::sync::Weak<Engine>);
 
 impl Engine {
     pub fn new(session: Session) -> Self {
-        Engine { registry: Registry::with_all_tools(), session: Mutex::new(session) }
+        Engine { registry: Registry::with_all_tools(), session: Mutex::new(session), pending: Mutex::new(Vec::new()) }
     }
 
     /// The engine as most apps use it: shared, with tools from higher layers (`extra`, e.g. the
@@ -139,7 +143,7 @@ impl Engine {
         std::sync::Arc::new_cyclic(|me| {
             let mut session = session;
             session.ext.insert(std::sync::Arc::new(EngineRef(me.clone())));
-            Engine { registry: Registry::new(tools).with_runtime(runtime), session: Mutex::new(session) }
+            Engine { registry: Registry::new(tools).with_runtime(runtime), session: Mutex::new(session), pending: Mutex::new(Vec::new()) }
         })
     }
 
@@ -150,16 +154,35 @@ impl Engine {
     /// Lock the session (recovering from a poisoned lock rather than cascading a panic).
     #[track_caller]
     pub fn session(&self) -> MutexGuard<'_, Session> {
-        self.session.lock().unwrap_or_else(PoisonError::into_inner)
+        let mut session = self.session.lock().unwrap_or_else(PoisonError::into_inner);
+        self.settle(&mut session);
+        session
     }
 
     /// Try to lock without blocking (the UI uses this so a long tool never freezes a frame).
     #[track_caller]
     pub fn try_session(&self) -> Option<MutexGuard<'_, Session>> {
-        match self.session.try_lock() {
-            Ok(g) => Some(g),
-            Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
-            Err(std::sync::TryLockError::WouldBlock) => None,
+        let mut session = match self.session.try_lock() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        self.settle(&mut session);
+        Some(session)
+    }
+
+    /// Take pending sign-in evidence into `session`'s ledger when it belongs to the project open
+    /// now (or to no project, with none open). Evidence for another project is already in that
+    /// project's store, so it's dropped from memory here, not recorded in the wrong ledger.
+    fn settle(&self, session: &mut Session) {
+        let pending = std::mem::take(&mut *self.pending.lock().unwrap_or_else(PoisonError::into_inner));
+        let open = session.project.as_ref().map(|p| p.root.clone());
+        for (root, ev) in pending {
+            if root == open
+                && let Err(e) = session.record(ev)
+            {
+                log::warn!("couldn't record a stopped sign-in's evidence: {}", e.message);
+            }
         }
     }
 
@@ -215,7 +238,8 @@ impl Engine {
         let started = std::time::Instant::now();
         let logged_params = journal::bounded(&params);
         let caller = opts.caller;
-        let result = self.call_inner(id, params, opts);
+        let mut journal_at = JournalAt::Live;
+        let result = self.call_inner(id, params, opts, &mut journal_at);
         let outcome = match &result {
             Ok(ToolOutput::Evidence(ev)) => serde_json::json!({"ok": true, "evidence_id": ev.id}),
             Ok(ToolOutput::Value(_)) => serde_json::json!({"ok": true}),
@@ -225,7 +249,12 @@ impl Engine {
         if let (Some(m), serde_json::Value::Object(o)) = (entry.as_object_mut(), outcome) {
             m.extend(o);
         }
-        self.journal("tool_call", entry);
+        match journal_at {
+            JournalAt::Live => self.journal("tool_call", entry),
+            // Written without the session: the call may have been stopped while another tool holds it.
+            JournalAt::Project(Some(root)) => journal::append(&root, "tool_call", entry),
+            JournalAt::Project(None) => {}
+        }
         result
     }
 
@@ -237,7 +266,7 @@ impl Engine {
         }
     }
 
-    fn call_inner(&self, id: &str, params: Value, opts: CallOptions<'_>) -> Result<ToolOutput, ToolError> {
+    fn call_inner(&self, id: &str, params: Value, opts: CallOptions<'_>, journal_at: &mut JournalAt) -> Result<ToolOutput, ToolError> {
         let spec = *self.registry.get(id).ok_or_else(|| {
             ToolError::invalid(format!("No tool named {id}")).with_remediation("List tools with `craft-anything-cli commands` or the command palette.")
         })?;
@@ -245,7 +274,11 @@ impl Engine {
         // not a wait forever. Tools are long jobs: the label says so (they have their own deadlines).
         let cancel = opts.cancel.clone();
         let mut session = match self.session.lock_unless(&|| cancel.is_cancelled()) {
-            Ok(g) => g.unwrap_or_else(PoisonError::into_inner),
+            Ok(g) => {
+                let mut g = g.unwrap_or_else(PoisonError::into_inner);
+                self.settle(&mut g);
+                g
+            }
             Err(craft_anything_platform::sync::GaveUp::Stopped) => return Err(ToolError::cancelled()),
             Err(craft_anything_platform::sync::GaveUp::Stuck(why)) => {
                 return Err(ToolError::new(ErrorCode::TimedOut, format!("{} couldn't start because another part of the app is stuck.", spec.title))
@@ -288,33 +321,69 @@ impl Engine {
                 run(&mut ctx, params)
             }))
         };
-        let result = if spec.id == tools::site_sign_in::SIGN_IN_TOOL {
+        if spec.id == tools::site_sign_in::SIGN_IN_TOOL {
             // Sign-in needs launch settings, not exclusive access to the person's live session.
             let mut isolated = Session::isolated(&session.config_dir());
             isolated.settings = session.settings.clone();
             isolated.deep_for_run = session.deep_for_run;
+            // The window may stay open while the person opens another project: what it saved
+            // belongs to the project it was started from.
+            let started_in = session.project.clone();
+            *journal_at = JournalAt::Project(started_in.as_ref().map(|p| p.root.clone()));
             drop(session);
-            let result = invoke(&mut isolated);
-            // Even a cancelled sign-in can return evidence of what the browser saved.
-            session = self.session();
-            session.label(spec.id);
-            result
-        } else {
-            invoke(&mut session)
-        };
-        let output = match result {
-            Ok(r) => r?,
-            Err(panic) => {
-                let what = panic.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| panic.downcast_ref::<String>().cloned()).unwrap_or_default();
-                log::error!("tool {id} panicked: {what}");
-                return Err(ToolError::internal(format!("{} hit a bug and stopped safely. Your work is kept. ({what})", spec.title)));
-            }
-        };
+            let output = Self::finished(spec.id, spec.title, invoke(&mut isolated))?;
+            self.record_sign_in(spec.id, &output, started_in.as_ref(), &cancel)?;
+            return Ok(output);
+        }
+        let output = Self::finished(spec.id, spec.title, invoke(&mut session))?;
         if let ToolOutput::Evidence(ev) = &output {
             session.record((**ev).clone())?;
         }
         Ok(output)
     }
+
+    /// A tool's own result, or its panic as an error (logged) instead of a crash.
+    fn finished(id: &str, title: &str, result: std::thread::Result<Result<ToolOutput, ToolError>>) -> Result<ToolOutput, ToolError> {
+        match result {
+            Ok(r) => r,
+            Err(panic) => {
+                let what = panic.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| panic.downcast_ref::<String>().cloned()).unwrap_or_default();
+                log::error!("tool {id} panicked: {what}");
+                Err(ToolError::internal(format!("{title} hit a bug and stopped safely. Your work is kept. ({what})")))
+            }
+        }
+    }
+
+    /// Record a finished sign-in's evidence in the project it started in. The live session is
+    /// waited for only until Stop; then, or when another project is open by now, the evidence goes
+    /// straight to the starting project's store, so a saved profile is never left unrecorded.
+    fn record_sign_in(&self, tool: &'static str, output: &ToolOutput, started_in: Option<&project::Project>, cancel: &CancelToken) -> Result<(), ToolError> {
+        let ToolOutput::Evidence(ev) = output else { return Ok(()) };
+        let root = started_in.map(|p| &p.root);
+        if let Ok(guard) = self.session.lock_unless(&|| cancel.is_cancelled()) {
+            let mut session = guard.unwrap_or_else(PoisonError::into_inner);
+            self.settle(&mut session);
+            session.label(tool);
+            if session.project.as_ref().map(|p| &p.root) == root {
+                return session.record((**ev).clone());
+            }
+            // Another project is open now: its ledger isn't where this belongs.
+            return started_in.map_or(Ok(()), |project| project.store_evidence(ev));
+        }
+        // Stopped while another tool holds the session: keep it on disk now and in the ledger later.
+        if let Some(project) = started_in {
+            project.store_evidence(ev)?;
+        }
+        self.pending.lock().unwrap_or_else(PoisonError::into_inner).push((root.cloned(), (**ev).clone()));
+        Ok(())
+    }
+}
+
+/// Where [`Engine::call`] journals a call: the live session's project, or one fixed when the call
+/// started (a sign-in that ran without holding the session).
+enum JournalAt {
+    Live,
+    Project(Option<std::path::PathBuf>),
 }
 
 #[cfg(test)]
@@ -327,7 +396,7 @@ mod tests {
         session.settings.engines.tools.chromium = Some(std::env::current_exe().unwrap());
         let mut specs = tools::all();
         specs.iter_mut().find(|s| s.id == tools::site_sign_in::SIGN_IN_TOOL).unwrap().run = run;
-        std::sync::Arc::new(Engine { registry: Registry::new(specs), session: Mutex::new(session) })
+        std::sync::Arc::new(Engine { registry: Registry::new(specs), session: Mutex::new(session), pending: Mutex::new(Vec::new()) })
     }
 
     #[test]
@@ -390,6 +459,124 @@ mod tests {
         assert_eq!(session.config_dir(), config);
         assert!(session.settings.deep_mode, "the snapshot must not overwrite live settings");
         assert_eq!(session.ledger().filter(|record| record.id == ev.id).count(), 1);
+    }
+
+    /// A sign-in held at its window until `gate` opens; it then returns sign-out evidence.
+    fn gated_sign_in(
+        e: &std::sync::Arc<Engine>,
+        cancel: CancelToken,
+        gate: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> (std::thread::JoinHandle<Result<ToolOutput, ToolError>>, std::sync::mpsc::Receiver<()>) {
+        let (started, entered) = std::sync::mpsc::channel();
+        let worker = e.clone();
+        let handle = std::thread::spawn(move || {
+            let progress = move |_: Progress| {
+                let _ = started.send(());
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while !gate.load(std::sync::atomic::Ordering::Acquire) && std::time::Instant::now() < deadline {
+                    std::thread::park_timeout(std::time::Duration::from_millis(5));
+                }
+            };
+            worker.call(
+                tools::site_sign_in::SIGN_IN_TOOL,
+                Value::Null,
+                CallOptions::new(Caller::Cli).with_consent(Consent::Granted).with_cancel(cancel).with_progress(&progress),
+            )
+        });
+        (handle, entered)
+    }
+
+    fn signs_out(ctx: &mut Ctx<'_>, _: Value) -> Result<ToolOutput, ToolError> {
+        ctx.report(None, "waiting for the person");
+        let forget = tools::site_sign_in::specs().into_iter().find(|s| s.id == tools::site_sign_in::SIGN_OUT_TOOL).unwrap();
+        (forget.run)(ctx, serde_json::json!({"url": "https://example.com"}))
+    }
+
+    fn journalled_sign_ins(root: &std::path::Path) -> usize {
+        journal::days(root)
+            .iter()
+            .flat_map(|d| journal::read_day(root, d))
+            .filter(|entry| entry.to_string().contains(tools::site_sign_in::SIGN_IN_TOOL))
+            .count()
+    }
+
+    /// Review of #1459: another project opened while the window is open doesn't get the sign-in's record.
+    #[test]
+    fn sign_in_records_in_the_project_it_started_in() {
+        use std::sync::{Arc, atomic::AtomicBool};
+        let dirs = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let a = project::Project::create(&dirs.0.path().join("a"), "A", project::Purpose::default()).unwrap();
+        let b = project::Project::create(&dirs.1.path().join("b"), "B", project::Purpose::default()).unwrap();
+        let e = sign_in_engine(signs_out);
+        e.session().project = Some(a.clone());
+        let gate = Arc::new(AtomicBool::new(false));
+        let (sign_in, entered) = gated_sign_in(&e, CancelToken::default(), gate.clone());
+        entered.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        e.session().project = Some(b.clone());
+        gate.store(true, std::sync::atomic::Ordering::Release);
+        let ToolOutput::Evidence(ev) = sign_in.join().unwrap().unwrap() else { panic!("expected evidence") };
+        assert!(a.load_evidence(&ev.id).is_ok(), "the starting project keeps the record");
+        assert!(b.load_evidence(&ev.id).is_err(), "the project opened meanwhile doesn't get it");
+        assert!(e.session().evidence(&ev.id).is_none(), "nor its ledger");
+        assert_eq!((journalled_sign_ins(&a.root), journalled_sign_ins(&b.root)), (1, 0));
+    }
+
+    /// Review of #1459: Stop ends the wait for a session another tool holds; the record is still kept.
+    #[test]
+    fn a_stopped_sign_in_does_not_wait_for_a_busy_session_and_keeps_its_record() {
+        use std::sync::{Arc, atomic::AtomicBool};
+        let dir = tempfile::tempdir().unwrap();
+        let a = project::Project::create(&dir.path().join("a"), "A", project::Purpose::default()).unwrap();
+        for with_project in [true, false] {
+            let e = sign_in_engine(signs_out);
+            if with_project {
+                e.session().project = Some(a.clone());
+            }
+            let gate = Arc::new(AtomicBool::new(false));
+            let cancel = CancelToken::default();
+            let (sign_in, entered) = gated_sign_in(&e, cancel.clone(), gate.clone());
+            entered.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            let busy = e.session();
+            cancel.cancel();
+            gate.store(true, std::sync::atomic::Ordering::Release);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !sign_in.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let finished = sign_in.is_finished();
+            drop(busy);
+            assert!(finished, "a stopped sign-in must not wait for the session (project: {with_project})");
+            let ToolOutput::Evidence(ev) = sign_in.join().unwrap().unwrap() else { panic!("expected evidence") };
+            if with_project {
+                assert!(a.load_evidence(&ev.id).is_ok(), "the saved profile's evidence is kept");
+                assert_eq!(journalled_sign_ins(&a.root), 1);
+            }
+            // Once the other tool lets go, the ledger has it too, once.
+            let session = e.session();
+            assert_eq!(session.ledger().filter(|r| r.id == ev.id).count(), 1, "project: {with_project}");
+        }
+    }
+
+    /// A stopped sign-in's evidence waits for the project it started in, never another one.
+    #[test]
+    fn pending_sign_in_evidence_reaches_only_its_own_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = project::Project::create(&dir.path().join("a"), "A", project::Purpose::default()).unwrap();
+        let e = sign_in_engine(signs_out);
+        let mut s = crate::testing::session();
+        let ToolOutput::Evidence(ev) = signs_out(
+            &mut Ctx { tool: tools::site_sign_in::SIGN_IN_TOOL, session: &mut s, cancel: CancelToken::default(), progress: &no_progress, caller: Caller::Cli },
+            Value::Null,
+        )
+        .unwrap() else {
+            panic!("expected evidence")
+        };
+        e.pending.lock().unwrap().push((Some(a.root.clone()), (*ev).clone()));
+        assert!(e.session().evidence(&ev.id).is_none(), "no project is open: not this ledger");
+        assert!(e.pending.lock().unwrap().is_empty(), "and it isn't kept waiting forever");
+        e.session().project = Some(a.clone());
+        e.pending.lock().unwrap().push((Some(a.root.clone()), (*ev).clone()));
+        assert!(e.session().evidence(&ev.id).is_some(), "its own project is open: recorded");
     }
 
     #[test]

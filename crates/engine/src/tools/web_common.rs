@@ -86,6 +86,23 @@ pub struct Browser {
     _watch: Option<RunningProcess>,
 }
 
+/// Launch flags for a browser that holds a sign-in (a sign-in window, or a copy of a saved one).
+fn sign_in_args(opts: &LaunchOptions) -> Vec<String> {
+    if opts.profile == ProfileChoice::Fresh && !opts.keeps_sign_in {
+        return Vec::new();
+    }
+    let mut args = Vec::new();
+    // A saved sign-in is made in a window and read later without one: on Linux both launches
+    // must keep cookies with the same key, so neither asks the desktop's keyring.
+    if cfg!(target_os = "linux") {
+        args.push("--password-store=basic".into());
+    }
+    // Only this profile has password saving turned off (`prepare_sign_in_profile`): never let a
+    // copied `Local State` pick another one.
+    args.push(format!("--profile-directory={}", super::site_sign_in::SIGN_IN_PROFILE));
+    args
+}
+
 struct BrowserProfile(std::path::PathBuf);
 
 fn remove_profile_with(mut remove: impl FnMut() -> std::io::Result<()>) -> std::io::Result<()> {
@@ -232,11 +249,14 @@ impl Browser {
         // folder, #747), so a saved sign-in is only ever copied in and out, never used in place.
         let owned = BrowserProfile(super::artifact_tools::fresh_dir_in(&profile_base(&exe, dirs::home_dir()), "craft-browser")?);
         if let ProfileChoice::SeededFrom(saved) = &opts.profile {
+            // The caller holds the site's reservation: a profile saved before password stores
+            // were left out loses them here (the copy below skips them either way).
+            super::site_sign_in::remove_credential_stores(saved);
             // On error the half-filled copy is removed as `owned` drops.
             super::site_sign_in::copy_profile(saved, &owned.0, &super::site_sign_in::CopyCaps::default())?;
         }
         if opts.keeps_sign_in || opts.profile != ProfileChoice::Fresh {
-            super::site_sign_in::keep_session_cookies(&owned.0)?;
+            super::site_sign_in::prepare_sign_in_profile(&owned.0)?;
         }
         let (profile_dir, profile) = (owned.0.clone(), Some(owned));
         let mut args: Vec<String> = vec![
@@ -257,11 +277,7 @@ impl Browser {
         if opts.no_sandbox {
             args.push("--no-sandbox".into());
         }
-        // A saved sign-in is made in a window and read later without one: on Linux both launches
-        // must keep cookies with the same key, so neither asks the desktop's keyring.
-        if cfg!(target_os = "linux") && (opts.profile != ProfileChoice::Fresh || opts.keeps_sign_in) {
-            args.push("--password-store=basic".into());
-        }
+        args.extend(sign_in_args(opts));
         args.push(opts.start_url.clone().unwrap_or_else(|| "about:blank".into()));
         let cancel = ctx.cancel.clone();
         let tail = StderrTail::default();
@@ -1160,6 +1176,21 @@ pub fn png_artifact(bytes: &[u8]) -> Result<Value, ToolError> {
 
 #[cfg(test)]
 mod tests {
+    /// Review of #1459: a copied `Local State` must not open a profile where saving passwords is on.
+    #[test]
+    fn sign_in_browsers_open_the_prepared_profile_and_fresh_ones_stay_plain() {
+        use super::{LaunchOptions, ProfileChoice, sign_in_args};
+        let pinned = format!("--profile-directory={}", super::super::site_sign_in::SIGN_IN_PROFILE);
+        let seeded = LaunchOptions { profile: ProfileChoice::SeededFrom("saved".into()), ..LaunchOptions::default() };
+        let window = LaunchOptions { keeps_sign_in: true, ..LaunchOptions::default() };
+        for opts in [&seeded, &window] {
+            let args = sign_in_args(opts);
+            assert!(args.contains(&pinned), "{args:?}");
+            assert_eq!(args.iter().any(|a| a == "--password-store=basic"), cfg!(target_os = "linux"), "{args:?}");
+        }
+        assert!(sign_in_args(&LaunchOptions::default()).is_empty());
+    }
+
     #[test]
     fn a_launched_browser_deletes_its_profile_on_drop() {
         let root = tempfile::tempdir().unwrap();

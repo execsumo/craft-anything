@@ -78,6 +78,10 @@ const ACTS_ON_MACHINE: [&str; 3] = ["plugins_add", "engines_install", "native_cu
 /// kept or deleted): off in restricted mode even with --allow-web.
 const ACTS_ON_DESKTOP: [&str; 2] = ["web_site_sign_in", "web_site_sign_out"];
 
+/// The web tool that starts from a saved sign-in unless told not to: always fresh in restricted
+/// mode (see `Server::restricted_args`).
+const SAVED_SIGN_IN_READER: &str = "web_site_open";
+
 impl Default for ServerOptions {
     fn default() -> Self {
         ServerOptions {
@@ -382,6 +386,30 @@ impl Server {
         })
     }
 
+    /// In restricted mode, `args` for `name` with saved sign-ins kept out: network access
+    /// (`--allow-web`) is not access to the person's accounts, so `web_site_open` always starts a
+    /// fresh browser here (`signed_in` becomes false) and asking for a saved sign-in is refused.
+    fn restricted_args(&self, name: &str, mut args: Value) -> Result<Value, ToolError> {
+        let registry = self.engine.registry();
+        if !self.opts.restricted || registry.canonical(name).unwrap_or(name) != SAVED_SIGN_IN_READER {
+            return Ok(args);
+        }
+        if args.get("signed_in").is_some_and(|v| v.as_bool() != Some(false) && !v.is_null()) {
+            return Err(ToolError::new(
+                craft_anything_evidence::ErrorCode::FeatureMissing,
+                format!("{SAVED_SIGN_IN_READER} can't use a saved sign-in in restricted mode."),
+            )
+            .with_remediation("Open the site with signed_in: false, or start the MCP server without --restricted to use saved sign-ins.")
+            .with_details(json!({"reason": "restricted_mode", "tool": SAVED_SIGN_IN_READER, "param": "signed_in"})));
+        }
+        if let Value::Object(m) = &mut args {
+            m.insert("signed_in".into(), json!(false));
+        } else if args.is_null() {
+            args = json!({"signed_in": false});
+        }
+        Ok(args)
+    }
+
     fn visible(&self, set: Toolset) -> bool {
         self.opts.all_tools || self.enabled.lock().unwrap_or_else(PoisonError::into_inner).contains(&set)
     }
@@ -524,6 +552,7 @@ impl Server {
         if let Some(err) = self.restricted_refusal(name) {
             return Err(err);
         }
+        let args = self.restricted_args(name, args)?;
         // A tool from a toolset that isn't enabled yet: enable it rather than refusing.
         if let Some(spec) = self.engine.registry().get(name)
             && !self.visible(spec.toolset)

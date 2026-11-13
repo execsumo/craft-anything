@@ -5,7 +5,9 @@
 //! in. `web_site_sign_out` deletes the saved sign-in.
 //!
 //! We never see, read or store a password, and never read cookie or storage values: the browser
-//! keeps them in its own profile files, which are only copied whole.
+//! keeps them in its own profile files, which are copied whole except for the browser's own
+//! password and card stores: saving those is turned off in these profiles, and any that exist are
+//! never copied (see [`is_credential_store`]).
 
 use super::browser_tools::browser_env;
 use super::native_common::spec;
@@ -145,15 +147,25 @@ pub(crate) fn lock_site(session: &Session, key: &str) -> Result<std::fs::File, T
     let file =
         std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path).map_err(|error| ToolError::io(path.display(), error))?;
     owner_only(&path, 0o600)?;
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(std::fs::TryLockError::WouldBlock) => {
-            Err(ToolError::new(ErrorCode::TimedOut, format!("Another browser operation is using the saved sign-in for {key}."))
-                .with_remediation("Close that site's sign-in window or wait for its browser operation to finish, then try again."))
+    // A program another thread is starting holds a copy of every open file until its exec closes
+    // them, so a reservation just released can still look held for a moment: try again briefly
+    // before calling the site busy. A real holder (a sign-in window) outlasts this by far.
+    let started = Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) if started.elapsed() < LOCK_GRACE => std::thread::sleep(Duration::from_millis(5)),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(ToolError::new(ErrorCode::TimedOut, format!("Another browser operation is using the saved sign-in for {key}."))
+                    .with_remediation("Close that site's sign-in window or wait for its browser operation to finish, then try again."));
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(ToolError::io(path.display(), error)),
         }
-        Err(std::fs::TryLockError::Error(error)) => Err(ToolError::io(path.display(), error)),
     }
 }
+
+/// How long [`lock_site`] keeps trying before it reports a site busy.
+const LOCK_GRACE: Duration = Duration::from_millis(250);
 
 /// A sign-in saved for one site.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -186,12 +198,18 @@ pub fn saved(session: &Session, key: &str) -> Option<SavedSignIn> {
 /// Largest `Preferences` file read back before changing it.
 const MAX_PREFERENCES_BYTES: u64 = 8 << 20;
 
-/// Make the browser profile at `profile` keep cookies that last only until the browser closes,
-/// the way a browser does when it's set to continue where it left off (`session.restore_on_startup`
-/// = 1 in `Default/Preferences`). The rest of an existing Preferences file is kept; one that is
-/// unreadable, too big or not a JSON object is replaced.
-pub fn keep_session_cookies(profile: &Path) -> Result<(), ToolError> {
-    let dir = profile.join("Default");
+/// The browser profile (inside the user-data folder) every sign-in and seeded browser starts in:
+/// the one [`prepare_sign_in_profile`] sets up, chosen with `--profile-directory`.
+pub(crate) const SIGN_IN_PROFILE: &str = "Default";
+
+/// Prepare the browser profile at `profile` for a sign-in: keep cookies that last only until the
+/// browser closes, the way a browser does when it's set to continue where it left off
+/// (`session.restore_on_startup` = 1 in `Default/Preferences`), and turn off saving passwords,
+/// addresses and cards, so the browser never offers to keep them in a profile we copy. The rest of
+/// an existing Preferences file is kept; one that is unreadable, too big or not a JSON object is
+/// replaced.
+pub fn prepare_sign_in_profile(profile: &Path) -> Result<(), ToolError> {
+    let dir = profile.join(SIGN_IN_PROFILE);
     std::fs::create_dir_all(&dir).map_err(|e| ToolError::io(dir.display(), e))?;
     let path = dir.join("Preferences");
     let existing = std::fs::symlink_metadata(&path)
@@ -209,6 +227,17 @@ pub fn keep_session_cookies(profile: &Path) -> Result<(), ToolError> {
     }
     if let Value::Object(s) = session {
         s.insert("restore_on_startup".into(), json!(1));
+    }
+    prefs.insert("credentials_enable_service".into(), json!(false));
+    prefs.insert("credentials_enable_autosignin".into(), json!(false));
+    for (section, key) in [("profile", "password_manager_enabled"), ("autofill", "profile_enabled"), ("autofill", "credit_card_enabled")] {
+        let s = prefs.entry(section).or_insert_with(|| json!({}));
+        if !s.is_object() {
+            *s = json!({});
+        }
+        if let Value::Object(s) = s {
+            s.insert(key.into(), json!(false));
+        }
     }
     let bytes = serde_json::to_vec(&Value::Object(prefs)).map_err(|e| ToolError::internal(e.to_string()))?;
     crate::project::write_atomic(&path, &bytes)
@@ -274,6 +303,34 @@ const SKIPPED_FILES: &[&str] = &[
     "Last Tabs",
 ];
 
+/// The browser's own stores of passwords, addresses and cards (SQLite files and their `-journal`,
+/// `-wal` and `-shm` companions). Saving to them is off in our profiles, but a profile saved before
+/// that, or a browser that ignores the setting, may still hold them: they are never copied.
+const CREDENTIAL_STORES: &[&str] = &["Login Data", "Web Data", "Account Web Data"];
+
+/// Whether a profile file is one of [`CREDENTIAL_STORES`] or a companion of one.
+pub(crate) fn is_credential_store(name: &str) -> bool {
+    CREDENTIAL_STORES.iter().any(|store| name.strip_prefix(store).is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '-'])))
+}
+
+/// Delete the credential stores a saved profile kept before they were left out of copies. Only the
+/// profile's top level and its browser profiles (`Default`, `Profile 1`, …) hold them; links are
+/// never followed. Best effort: a seeded copy skips them anyway.
+pub(crate) fn remove_credential_stores(profile: &Path) {
+    let mut dirs = vec![profile.to_path_buf()];
+    if let Ok(entries) = std::fs::read_dir(profile) {
+        dirs.extend(entries.flatten().filter(|e| e.file_type().is_ok_and(|t| t.is_dir())).map(|e| e.path()).take(1_000));
+    }
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for e in entries.flatten().take(20_000) {
+            if e.file_type().is_ok_and(|t| t.is_file()) && is_credential_store(&e.file_name().to_string_lossy()) {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+}
+
 /// Make a folder only its owner can open. On Windows the folder keeps the access rules of the
 /// person's own config folder, which already keeps other users out.
 fn private_dir(path: &Path) -> Result<(), ToolError> {
@@ -309,8 +366,8 @@ fn unique(prefix: &str) -> String {
     format!("{prefix}-{}-{}-{nanos}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
 }
 
-/// Copy the saved profile `from` into the empty folder `to`, skipping caches and lock files and
-/// never following a link (links are left out). Going over a cap is an error, not a partial copy.
+/// Copy the saved profile `from` into the empty folder `to`, skipping caches, lock files and the
+/// browser's password and card stores, and never following a link (links are left out). Going over a cap is an error, not a partial copy.
 pub fn copy_profile(from: &Path, to: &Path, caps: &CopyCaps) -> Result<(), ToolError> {
     let over = |what: String| {
         ToolError::new(ErrorCode::OverLimit, format!("The sign-in profile is too big to copy: {what}.")).with_remediation(format!(
@@ -346,7 +403,7 @@ pub fn copy_profile(from: &Path, to: &Path, caps: &CopyCaps) -> Result<(), ToolE
                 private_dir(&target)?;
                 stack.push((path, target, depth.saturating_add(1)));
             } else if meta.is_file() {
-                if SKIPPED_FILES.contains(&name_str.as_ref()) {
+                if SKIPPED_FILES.contains(&name_str.as_ref()) || is_credential_store(&name_str) {
                     continue;
                 }
                 files = files.saturating_add(1);

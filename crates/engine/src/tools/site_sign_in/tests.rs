@@ -131,6 +131,57 @@ fn a_profile_copy_skips_caches_locks_and_links() {
     assert!(from.join("Default/Cache/data_0").is_file(), "the saved sign-in is untouched");
 }
 
+/// Review of #1459: a password the person let the browser save must not travel with the sign-in.
+#[test]
+fn password_and_card_stores_are_never_copied_and_leave_an_earlier_profile() {
+    let s = crate::testing::session();
+    let from = save_fixture(&s, "site-example.com_443");
+    let stores = [
+        "Default/Login Data",
+        "Default/Login Data-journal",
+        "Default/Login Data For Account",
+        "Default/Login Data For Account-wal",
+        "Default/Web Data",
+        "Default/Web Data-shm",
+        "Default/Account Web Data",
+        "Profile 1/Login Data",
+    ];
+    std::fs::create_dir_all(from.join("Profile 1")).unwrap();
+    for f in stores {
+        std::fs::write(from.join(f), b"fake-password-store").unwrap();
+    }
+    // Look-alikes that are not credential stores still travel.
+    std::fs::write(from.join("Default/Login Database Notes"), b"kept").unwrap();
+    let to = tempfile::tempdir().unwrap();
+    copy_profile(&from, to.path(), &CopyCaps::default()).unwrap();
+    assert_eq!(std::fs::read(to.path().join("Default/Cookies")).unwrap(), b"fake-cookie-db");
+    assert!(to.path().join("Default/Login Database Notes").is_file());
+    for f in stores {
+        assert!(std::fs::symlink_metadata(to.path().join(f)).is_err(), "{f} was copied");
+    }
+    // A profile saved before the stores were left out loses them when it's next used.
+    remove_credential_stores(&from);
+    for f in stores {
+        assert!(std::fs::symlink_metadata(from.join(f)).is_err(), "{f} was left in the saved profile");
+    }
+    assert_eq!(std::fs::read(from.join("Default/Cookies")).unwrap(), b"fake-cookie-db");
+}
+
+#[test]
+fn sign_in_profiles_turn_off_password_and_card_saving() {
+    let d = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(d.path().join("Default")).unwrap();
+    std::fs::write(d.path().join("Default/Preferences"), br#"{"profile": {"password_manager_enabled": true, "name": "x"}, "autofill": 3}"#).unwrap();
+    prepare_sign_in_profile(d.path()).unwrap();
+    let prefs: Value = serde_json::from_slice(&std::fs::read(d.path().join("Default/Preferences")).unwrap()).unwrap();
+    assert_eq!(prefs["credentials_enable_service"], false);
+    assert_eq!(prefs["credentials_enable_autosignin"], false);
+    assert_eq!(prefs["profile"]["password_manager_enabled"], false);
+    assert_eq!(prefs["profile"]["name"], "x");
+    assert_eq!(prefs["autofill"]["profile_enabled"], false);
+    assert_eq!(prefs["autofill"]["credit_card_enabled"], false);
+}
+
 #[test]
 fn session_cookies_are_kept_whatever_preferences_were_there() {
     let prefs_after = |before: Option<&[u8]>| {
@@ -139,7 +190,7 @@ fn session_cookies_are_kept_whatever_preferences_were_there() {
             std::fs::create_dir_all(d.path().join("Default")).unwrap();
             std::fs::write(d.path().join("Default/Preferences"), b).unwrap();
         }
-        keep_session_cookies(d.path()).unwrap();
+        prepare_sign_in_profile(d.path()).unwrap();
         serde_json::from_slice::<Value>(&std::fs::read(d.path().join("Default/Preferences")).unwrap()).unwrap()
     };
     assert_eq!(prefs_after(None)["session"]["restore_on_startup"], 1);

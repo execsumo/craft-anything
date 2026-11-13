@@ -460,6 +460,55 @@ fn restricted_mode_allows_web_and_capture_tools_when_operator_permits() {
     assert!(!names_cap.iter().any(|n| n.starts_with("adb_")));
 }
 
+/// Review of #1459: --allow-web (with --allow-run) must not let a restricted client open the
+/// desktop person's saved account; sign-in is hidden there, so reusing one would bypass that.
+#[test]
+fn restricted_web_opens_never_use_a_saved_sign_in() {
+    use craft_anything_engine::tools::site_sign_in;
+    let session = craft_anything_engine::testing::session();
+    // A saved sign-in for the site, as web_site_sign_in leaves it.
+    let key = site_sign_in::site_key("https://example.com").unwrap();
+    let dir = site_sign_in::sign_ins_dir(&session).join(&key);
+    std::fs::create_dir_all(dir.join("profile/Default")).unwrap();
+    std::fs::write(dir.join("profile/Default/Cookies"), b"fake-cookie-db").unwrap();
+    std::fs::write(dir.join("sign-in.json"), json!({"version": 1, "site": key, "saved_at": 1}).to_string()).unwrap();
+    assert!(site_sign_in::saved(&session, &key).is_some(), "the fixture must look like a saved sign-in");
+    let engine = Arc::new(Engine::new(session));
+    let opts = ServerOptions { restricted: true, allow_web: true, allow_run: true, ..Default::default() };
+
+    let input: String = [
+        req(1, "tools/call", json!({"name": "web_site_open", "arguments": {"url": "https://example.com", "signed_in": true}})),
+        req(2, "tools/call", json!({"name": "mcp__craft-anything__web_site_open", "arguments": {"url": "https://example.com", "signed_in": "yes"}})),
+    ]
+    .iter()
+    .map(|l| format!("{l}\n"))
+    .collect();
+    let buf = Buf::default();
+    serve(engine.clone(), opts.clone(), std::io::Cursor::new(input.into_bytes()), Box::new(buf.clone())).unwrap();
+    let out: Vec<Value> = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    for id in [1, 2] {
+        let r = response(&out, id);
+        assert_eq!(r["result"]["isError"], true, "id {id}");
+        let e: Value = serde_json::from_str(r["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(e["error"]["details"]["reason"], "restricted_mode", "id {id}: {e}");
+        assert_eq!(e["error"]["details"]["param"], "signed_in", "id {id}: {e}");
+    }
+
+    // Omitted (which would pick the saved sign-in) and explicit false both reach the tool as false.
+    let server = Server::new(engine.clone(), opts, Box::new(Buf::default()));
+    for args in [
+        json!({"url": "https://example.com"}),
+        json!({"url": "https://example.com", "signed_in": false}),
+        json!({"url": "https://example.com", "signed_in": null}),
+    ] {
+        assert_eq!(server.restricted_args("web_site_open", args).unwrap()["signed_in"], false);
+    }
+    // Other tools and unrestricted servers are left alone.
+    assert_eq!(server.restricted_args("core_session_show", json!({})).unwrap(), json!({}));
+    let open = Server::new(engine, ServerOptions::default(), Box::new(Buf::default()));
+    assert_eq!(open.restricted_args("web_site_open", json!({"url": "https://example.com"})).unwrap(), json!({"url": "https://example.com"}));
+}
+
 #[test]
 fn restricted_mode_server_options_from_env() {
     let map = [("CRAFT_ANYTHING_MCP_RESTRICTED", "1"), ("CRAFT_ANYTHING_MCP_ALLOW_WEB", "true"), ("CRAFT_ANYTHING_MCP_ALLOW_CAPTURE", "1")]

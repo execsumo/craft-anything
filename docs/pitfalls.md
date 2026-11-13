@@ -157,6 +157,12 @@ must release that resource and empty its registry. Do not reserve and release a 
 CI the banner moved the layout under another test running beside it, and its click missed. It passed
 25 runs on a Mac. Anything a test sets for the whole process goes in a test program of its own.
 
+**A released file lock that still looked held.** Saved sign-in reservations use `flock`; a
+program another thread was starting held a copy of the lock file until its exec closed it, so a
+sign-out right after the reservation was dropped was refused as busy in about one full engine
+run in four, never alone. A non-blocking lock tries again for a moment (`lock_site`'s
+`LOCK_GRACE`) before calling something busy, and a lock test is run inside the full suite.
+
 **A free port handed to another test.** For a negative TCP probe, a bound port stopped being
 ours as soon as its listener was dropped. Another fixture could acquire it before the probe.
 Use the unassigned loopback port zero to exercise a real connection refusal without borrowing
@@ -840,6 +846,13 @@ named limitation, and make the map partial; test both the old 2,000 boundary and
 `env` values included, which can hold API keys; a tool's output reaches the journal and MCP
 clients. The journal only redacts by field name. When a setting can hold a secret, hide its value
 in every tool that prints settings, and test that it doesn't appear.
+
+**Network access that became account access.** Restricted MCP hid the sign-in tools, but
+`web_site_open`, allowed by `--allow-web`, picked a saved sign-in by default, so a client that
+couldn't sign in could still browse the person's account. When a tool gains a default that reaches
+stored credentials, check every mode that admits it, and give the narrower mode its own rule.
+The same profile copy also carried the browser's saved-password store: "we never store a
+password" has to cover what the browser itself offers to keep.
 
 **A secret check that matched a word inside a name.** `cargo xtask secrets` took any variable
 with `AUTH` in its name as a secret; git sets `GIT_AUTHOR_NAME` while the hook runs, so a contributor
