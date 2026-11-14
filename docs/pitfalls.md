@@ -302,6 +302,15 @@ browser outlived the CLI (the job isn't killed when closed) and held the shell's
 the command hung and old browsers piled up. Start programs that hand off with `.hands_off()`, and
 after a live run check that the command returned and nothing it started is still running.
 
+**A live browser test that died on a line about crashpad.** On Ubuntu with
+`kernel.apparmor_restrict_unprivileged_userns=1`, a Chromium that has no AppArmor profile (Playwright's
+copy, Chrome for Testing) can't build its sandbox and exits at once; the only stderr line we kept was a
+harmless crashpad warning (`cpufreq/scaling_max_freq`), so all five live sign-in tests failed in 1.5 s with
+"closed before it was ready". Don't turn the sandbox off in the product for it: point
+`CRAFT_ANYTHING_TEST_CHROMIUM` at a throwaway wrapper in `/tmp` that adds `--no-sandbox`, only for a browser
+that visits a server on 127.0.0.1. A helper that connects the moment the debugging port file appears must
+also wait for the first page target (`first_page`): it raced the browser's own start.
+
 **A separate config folder hides the agent's own settings.** To keep a live run from touching the
 real `config.toml`, `XDG_CONFIG_HOME` was pointed at a scratch folder; the agent CLI we start reads
 the same variable, lost its own provider settings, and failed with "unsupported provider". Back up

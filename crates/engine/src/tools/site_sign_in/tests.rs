@@ -562,27 +562,78 @@ fn processes_naming(needle: &str) -> usize {
 fn person(base: String, before: Vec<PathBuf>, sign_in: bool) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let dl = Deadline::new(Duration::from_secs(60), CancelToken::default());
-        let endpoint = loop {
-            assert!(!dl.expired(), "no sign-in browser appeared");
-            let port = browser_profiles().into_iter().filter(|p| !before.contains(p)).find_map(|p| {
-                std::fs::read_to_string(p.join("DevToolsActivePort")).ok().and_then(|t| t.lines().next().and_then(|l| l.trim().parse::<u16>().ok()))
-            });
-            if let Some(port) = port {
-                break cdp::parse_endpoint(&format!("http://127.0.0.1:{port}")).unwrap();
-            }
-            std::thread::sleep(Duration::from_millis(200));
-        };
+        let endpoint = window_endpoint(&before, &dl);
         let b = Browser::attached(&endpoint, "test", "");
         if sign_in {
-            let targets = cdp::json_list(&endpoint, &dl).unwrap();
-            let page = web_common::pick_target(&targets, None, Some("page")).unwrap();
-            let mut c = web_common::connect_target(&b, page, 1 << 20, &dl).unwrap();
+            let page = first_page(&endpoint, &dl);
+            let mut c = web_common::connect_target(&b, &page, 1 << 20, &dl).unwrap();
             c.call("Page.navigate", json!({"url": format!("{base}/login")}), None, &dl).unwrap();
             std::thread::sleep(Duration::from_secs(3));
         }
         let version = cdp::json_version(&endpoint, &dl).unwrap();
         let mut c = web_common::connect_target(&b, &version, 1 << 20, &dl).unwrap();
         let _ = c.call("Browser.close", json!({}), None, &dl);
+    })
+}
+
+/// The browser's first page: it starts with one, but the debugging port can be up a moment before it is listed.
+fn first_page(endpoint: &cdp::Endpoint, dl: &Deadline) -> Value {
+    loop {
+        let targets = cdp::json_list(endpoint, dl).unwrap();
+        if let Ok(page) = web_common::pick_target(&targets, None, Some("page")) {
+            return page.clone();
+        }
+        assert!(!dl.expired(), "the sign-in browser never listed a page");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// A preference as `chrome://prefs-internals` shows it: `{metadata, value}`, under its dotted name or
+/// nested by the dots. Either way the setting itself is `value`.
+fn effective_pref<'a>(prefs: &'a Value, dotted: &str) -> Option<&'a Value> {
+    let node = prefs.get(dotted).or_else(|| dotted.split('.').try_fold(prefs, |v, k| v.get(k)))?;
+    node.get("value").or(Some(node))
+}
+
+/// The debugging endpoint of the first browser profile that wasn't there `before`.
+fn window_endpoint(before: &[PathBuf], dl: &Deadline) -> cdp::Endpoint {
+    loop {
+        assert!(!dl.expired(), "no sign-in browser appeared");
+        let port = browser_profiles()
+            .into_iter()
+            .filter(|p| !before.contains(p))
+            .find_map(|p| std::fs::read_to_string(p.join("DevToolsActivePort")).ok().and_then(|t| t.lines().next().and_then(|l| l.trim().parse::<u16>().ok())));
+        if let Some(port) = port {
+            return cdp::parse_endpoint(&format!("http://127.0.0.1:{port}")).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Play the person, but read what the window says about itself: after a sign-in it shows the
+/// browser's own `chrome://version` and `chrome://prefs-internals` pages, returns their text, then
+/// closes the browser as closing its window would.
+fn window_reports(base: String, before: Vec<PathBuf>) -> std::thread::JoinHandle<(String, String)> {
+    std::thread::spawn(move || {
+        let dl = Deadline::new(Duration::from_secs(60), CancelToken::default());
+        let endpoint = window_endpoint(&before, &dl);
+        let b = Browser::attached(&endpoint, "test", "");
+        let page = first_page(&endpoint, &dl);
+        let mut c = web_common::connect_target(&b, &page, 1 << 20, &dl).unwrap();
+        c.call("Page.navigate", json!({"url": format!("{base}/login")}), None, &dl).unwrap();
+        std::thread::sleep(Duration::from_secs(3));
+        let mut text_of = |url: &str| {
+            c.call("Page.navigate", json!({"url": url}), None, &dl).unwrap();
+            std::thread::sleep(Duration::from_secs(3));
+            let v = crate::tools::website_tools::eval(&mut c, "document.body.innerText", &dl).unwrap();
+            v.as_str().unwrap_or_default().to_string()
+        };
+        let version = text_of("chrome://version");
+        let prefs = text_of("chrome://prefs-internals");
+        let v = cdp::json_version(&endpoint, &dl).unwrap();
+        let mut c = web_common::connect_target(&b, &v, 1 << 20, &dl).unwrap();
+        let _ = c.call("Browser.close", json!({}), None, &dl);
+        (version, prefs)
     })
 }
 
@@ -721,4 +772,42 @@ fn a_sign_in_the_site_forgets_is_caught_by_the_check() {
     helper.join().unwrap();
     assert_eq!(v["result"]["check"]["sign_in_page"], true, "{}", v["result"]["check"]);
     assert!(v["limitations"].to_string().contains("sign_in_not_kept"), "{}", v["limitations"]);
+}
+
+/// Chromium itself reports that the window runs the prepared `Default` profile with password and
+/// card saving off, and what is saved afterwards holds none of its credential stores.
+#[test]
+#[ignore]
+fn the_sign_in_window_runs_the_prepared_profile_with_saving_off() {
+    let base = test_site();
+    let cfg = tempfile::tempdir().unwrap();
+    let e = Engine::new(live_in(cfg.path()));
+    let reports = window_reports(base.clone(), browser_profiles());
+    let v = e.call(SIGN_IN_TOOL, json!({"url": format!("{base}/account"), "timeout_secs": 120}), granted()).unwrap().to_json();
+    let (version, prefs) = reports.join().unwrap();
+    assert_eq!(v["result"]["saved"], true, "{v}");
+
+    let profile_path = version.lines().find(|l| l.starts_with("Profile Path")).unwrap_or_default();
+    println!("window: {} / {profile_path}", version.lines().find(|l| l.contains("Chrom")).unwrap_or_default());
+    assert!(profile_path.trim_end().ends_with(&format!("/{SIGN_IN_PROFILE}")), "the window opened another profile: {profile_path:?} in {version:?}");
+
+    let prefs: Value = serde_json::from_str(prefs.trim()).unwrap_or_else(|e| panic!("prefs-internals wasn't JSON ({e}): {prefs:.300}"));
+    for key in ["credentials_enable_service", "credentials_enable_autosignin", "autofill.profile_enabled", "autofill.credit_card_enabled"] {
+        assert_eq!(
+            effective_pref(&prefs, key),
+            Some(&json!(false)),
+            "{key} is not off in the window's own preferences; its top-level keys: {:?}",
+            prefs.as_object().map(|o| o.keys().take(60).collect::<Vec<_>>())
+        );
+    }
+    // Older Chromium builds also have `profile.password_manager_enabled`. A newer one may not know it
+    // at all (it was folded into `credentials_enable_service`), which leaves nothing to turn off.
+    if let Some(legacy) = effective_pref(&prefs, "profile.password_manager_enabled") {
+        assert_eq!(legacy, &json!(false), "the legacy password-manager preference is on");
+    }
+
+    let saved_dir = sign_ins_dir(&live_in(cfg.path())).join(site_key(&base).unwrap());
+    let stores: Vec<_> =
+        snapshot(&saved_dir).into_iter().filter(|(p, _)| p.file_name().is_some_and(|n| is_credential_store(&n.to_string_lossy()))).map(|(p, _)| p).collect();
+    assert!(stores.is_empty(), "credential stores were saved: {stores:?}");
 }

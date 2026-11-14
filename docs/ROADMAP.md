@@ -1618,7 +1618,10 @@ Gaps found while using the app for real projects.
       that exact site (copied into the private profile, never changed by a capture), and
       `web_site_sign_out` forgets it; the builder is told when the capture was signed in. Addresses
       #1178. Live with Chromium on Linux against a local test site (virtual display, scripted
-      sign-in); a confined Snap or Flatpak browser and a real site were not run
+      sign-in); a confined Snap or Flatpak browser and a real site were not run. The window's own
+      `chrome://version` and `chrome://prefs-internals` showed the `Default` profile and password and card
+      saving off (Chrome for Testing 156, live test
+      `the_sign_in_window_runs_the_prepared_profile_with_saving_off`); Windows and macOS were not run
       — claimed: execsumo, branch feature/r2.9-signed-in-website-study
       Review fixes: saved profiles use normalized host and effective port; browser reuse also
       checks the saved revision, and explicit `signed_in: false` always starts fresh. Builder
